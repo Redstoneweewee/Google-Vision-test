@@ -1,13 +1,23 @@
 /**
- * Hybrid receipt-line reconstruction algorithm.
+ * Hybrid receipt-line reconstruction algorithm (Method 3: line-first).
  *
  * Pipeline:
- *   1. Estimate global text rotation angle (histogram of pairwise angles)
- *   2. Rotate all boxes & cluster into lines by rotated-Y
- *   3. RANSAC-split any oversized cluster (perspective / curved receipts)
- *   4. Order words left→right inside each line (graph-style chaining)
- *   5. Detect the price column, assign prices, classify lines
- *   6. Handle wrapped item names & discount/tax lines
+ *   1a. Build tentative lines via neighbor graph (local y-overlap chaining)
+ *   1b. Compute per-line baseline angle via least-squares fit
+ *   1c. Fallback: estimate global angle for singletons
+ *   2.  Per-line rotation + RANSAC-split any oversized cluster
+ *   3.  Order words left→right inside each line
+ *   4.  Detect the price column, assign prices, classify lines
+ *   5.  Sort top→bottom, handle wrapped item names & discount/tax lines
+ *
+ * Why Method 3:
+ *   A single global rotation angle fails when the receipt has a fold or
+ *   local curvature — prices at the far right shift to a different
+ *   rotated-Y and get assigned to the wrong line.  Method 3 builds
+ *   tentative lines from LOCAL adjacency (y-overlap of nearby words),
+ *   then derives a stable per-line angle so each line is de-skewed
+ *   independently.  This is inherently robust to folds because adjacent
+ *   words always have high y-overlap regardless of distant curvature.
  */
 
 import { protos } from '@google-cloud/vision';
@@ -41,6 +51,9 @@ import {
   PRICE_COLUMN_TOLERANCE_FACTOR,
   WRAP_MAX_VERTICAL_GAP_FACTOR,
   WRAP_MAX_LEFT_ALIGN_FACTOR,
+  NEIGHBOR_Y_OVERLAP_MIN,
+  NEIGHBOR_MAX_X_GAP_FACTOR,
+  NEIGHBOR_MAX_HEIGHT_RATIO,
 } from './constants';
 
 type TextAnnotation = protos.google.cloud.vision.v1.IEntityAnnotation;
@@ -58,14 +71,145 @@ interface RotatedBox extends WordBox {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Stage 1 – Estimate the dominant text angle
+   Stage 1a – Build tentative lines via neighbor graph
    ─────────────────────────────────────────────────────────────────────────
-   For every pair of nearby, horizontally-separated word boxes we compute
-   the angle of the vector between their centers.  A histogram (0.5° bins)
-   reveals the peak near 0° which is the receipt's roll angle.  We ignore
-   pairs that are too far apart vertically (> 3× median height) or too
-   close horizontally (< 0.5× median height) to filter out cross-line and
-   same-word noise.
+   For each word box, find its nearest right neighbor (smallest x-gap)
+   among all boxes with sufficient y-overlap and similar height.
+   Union-find groups transitively connected boxes into tentative lines.
+   Each line is sorted left → right by center x.
+
+   This works even on folded/curved receipts because:
+   - Adjacent words on the same line are close in x (gap ~ 1–3 char widths)
+   - The y-shift between adjacent words = Δx × sin(angle), which is tiny
+     for small Δx, so y-overlap stays high regardless of local angle
+   - The chain structure bridges from left to right across the full line;
+     we never need to directly connect far-apart words
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+class UnionFind {
+  private parent: number[];
+  private rank: number[];
+
+  constructor(n: number) {
+    this.parent = Array.from({ length: n }, (_, i) => i);
+    this.rank = new Array(n).fill(0);
+  }
+
+  find(x: number): number {
+    if (this.parent[x] !== x) this.parent[x] = this.find(this.parent[x]);
+    return this.parent[x];
+  }
+
+  union(a: number, b: number): void {
+    const ra = this.find(a);
+    const rb = this.find(b);
+    if (ra === rb) return;
+    if (this.rank[ra] < this.rank[rb]) {
+      this.parent[ra] = rb;
+    } else if (this.rank[ra] > this.rank[rb]) {
+      this.parent[rb] = ra;
+    } else {
+      this.parent[rb] = ra;
+      this.rank[ra]++;
+    }
+  }
+}
+
+function buildTentativeLines(boxes: WordBox[], medH: number): WordBox[][] {
+  const n = boxes.length;
+  if (n === 0) return [];
+
+  const uf = new UnionFind(n);
+
+  for (let i = 0; i < n; i++) {
+    const A = boxes[i];
+    let bestJ = -1;
+    let bestXDist = Infinity;
+
+    for (let j = 0; j < n; j++) {
+      if (i === j) continue;
+      const B = boxes[j];
+
+      // B must be to the right of A
+      if (B.center.x <= A.center.x) continue;
+
+      // Y-overlap: intersection of vertical extents / smaller height
+      const overlapTop = Math.max(A.top, B.top);
+      const overlapBottom = Math.min(A.bottom, B.bottom);
+      const overlap = Math.max(0, overlapBottom - overlapTop);
+      const minH = Math.min(A.height, B.height);
+      if (minH <= 0 || overlap / minH < NEIGHBOR_Y_OVERLAP_MIN) continue;
+
+      // Height similarity
+      const maxH = Math.max(A.height, B.height);
+      if (maxH / minH > NEIGHBOR_MAX_HEIGHT_RATIO) continue;
+
+      // X-gap (edge-to-edge, clamped to 0 for overlapping boxes)
+      const xGap = Math.max(0, B.left - A.right);
+      if (xGap > NEIGHBOR_MAX_X_GAP_FACTOR * medH) continue;
+
+      // Pick the closest right neighbor (by center-x distance)
+      const xDist = B.center.x - A.center.x;
+      if (xDist < bestXDist) {
+        bestXDist = xDist;
+        bestJ = j;
+      }
+    }
+
+    if (bestJ >= 0) {
+      uf.union(i, bestJ);
+    }
+  }
+
+  // Extract connected components
+  const groups = new Map<number, number[]>();
+  for (let i = 0; i < n; i++) {
+    const root = uf.find(i);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root)!.push(i);
+  }
+
+  return Array.from(groups.values())
+    .map((indices) => indices.map((idx) => boxes[idx]))
+    .map((line) => [...line].sort((a, b) => a.center.x - b.center.x));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Stage 1b – Compute per-line baseline angle
+   ─────────────────────────────────────────────────────────────────────────
+   For each tentative line with ≥ 2 words, fit a line through the word
+   centres using ordinary least squares and return the angle.  This is
+   far more stable than per-word angles because it's averaged over many
+   points (reducing OCR jitter).  Lines with a single word return 0
+   (sentinel for "use the fallback global angle").
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function computeLineAngle(line: WordBox[]): number {
+  if (line.length < 2) return 0;
+
+  const n = line.length;
+  const meanX = line.reduce((s, b) => s + b.center.x, 0) / n;
+  const meanY = line.reduce((s, b) => s + b.center.y, 0) / n;
+
+  let num = 0;
+  let den = 0;
+  for (const box of line) {
+    const dx = box.center.x - meanX;
+    const dy = box.center.y - meanY;
+    num += dx * dy;
+    den += dx * dx;
+  }
+
+  if (Math.abs(den) < 1e-9) return 0;
+  return Math.atan2(num, den);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Stage 1c – Global angle estimation (fallback for singletons)
+   ─────────────────────────────────────────────────────────────────────────
+   Retained from the original pipeline.  Used only when:
+   - A tentative line has a single word (can't compute a per-line angle)
+   - No multi-word lines exist at all (edge case)
    ═══════════════════════════════════════════════════════════════════════════ */
 
 function estimateGlobalAngle(boxes: WordBox[]): number {
@@ -125,14 +269,10 @@ function estimateGlobalAngle(boxes: WordBox[]): number {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Stage 2 – Rotate boxes & cluster into lines by rotated-Y
+   Stage 2a – Rotate boxes (per-line)
    ─────────────────────────────────────────────────────────────────────────
-   After rotating all centres by −θ the text becomes roughly horizontal.
-   We sweep the boxes sorted by rotated-Y and greedily assign each box to
-   the cluster whose mean-Y is closest, provided the distance is less than
-   0.6 × median word height.  This threshold is tuned for receipt line
-   spacing (thermal printers use ~1.2× text height between baselines, so
-   0.6× puts the boundary right between two lines).
+   Same rotation logic as before, but now called once per tentative line
+   with that line's own angle instead of a single global angle.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 function rotateBoxes(boxes: WordBox[], angle: number): RotatedBox[] {
@@ -151,6 +291,11 @@ function rotateBoxes(boxes: WordBox[], angle: number): RotatedBox[] {
     };
   });
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Stage 2b – Y-cluster within a per-line rotation (unused in normal flow
+   but retained for the RANSAC split fallback path)
+   ═══════════════════════════════════════════════════════════════════════════ */
 
 function clusterIntoLines(
   boxes: RotatedBox[],
@@ -190,14 +335,12 @@ function clusterIntoLines(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Stage 3 – RANSAC split for messy (multi-row) clusters
+   Stage 2c – RANSAC split for oversized tentative lines
    ─────────────────────────────────────────────────────────────────────────
-   A cluster whose rotated-Y range exceeds 1.5 × median height likely
-   merged two real lines (perspective distortion made them close).  We run
-   RANSAC on the (x′, y′) centres: pick 2 random points, fit a line,
-   count inliers within 0.4 × medH, keep the best set, remove them, and
-   repeat until < 2 points remain.  Any singletons are attached to their
-   nearest sub-line.
+   Now applied per-tentative-line: if the rotated-Y range of a tentative
+   line (using that line's own angle) exceeds the threshold, RANSAC splits
+   it.  This catches cases where the neighbor graph accidentally merged
+   two close lines (tight spacing + large font size overlap).
    ═══════════════════════════════════════════════════════════════════════════ */
 
 function ransacSplitCluster(
@@ -296,12 +439,7 @@ function meanY(line: RotatedBox[]): number {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Stage 4 – Order words left → right inside each line
-   ─────────────────────────────────────────────────────────────────────────
-   Simple sort by rotated left-edge.  For receipt lines (typically 3–8
-   tokens) this is sufficient; a full graph-chain is overkill but the sort
-   achieves the same result because there are no branching ambiguities on
-   a single-column receipt.
+   Stage 3 – Order words left → right inside each line
    ═══════════════════════════════════════════════════════════════════════════ */
 
 function orderWordsInLine(line: RotatedBox[]): RotatedBox[] {
@@ -326,14 +464,7 @@ function buildLineText(ordered: RotatedBox[], charW: number): string {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   Stage 5 – Detect the price column & assign prices
-   ─────────────────────────────────────────────────────────────────────────
-   Most receipts right-align all prices in a single column.  We collect
-   the rotated right-edge x of every price-like token and take the median;
-   this is the "price column".  When assigning a price to a line, we walk
-   tokens right-to-left and accept the first price-matching token whose
-   right-edge is near the column (within 3 × median height).  This avoids
-   picking up quantities like "2.00" from "2.00 kg" on the left side.
+   Stage 4 – Detect the price column & assign prices
    ═══════════════════════════════════════════════════════════════════════════ */
 
 function detectPriceColumnX(allLines: RotatedBox[][]): number | null {
@@ -415,7 +546,7 @@ function handleWrappedNames(lines: ReceiptLine[], medH: number): void {
 export interface ReconstructionResult {
   /** Ordered receipt lines, top-to-bottom. */
   lines: ReceiptLine[];
-  /** The global rotation angle (radians) estimated in Stage 1. */
+  /** Median of per-line angles (radians); representative global angle. */
   angle: number;
 }
 
@@ -423,7 +554,8 @@ export interface ReconstructionResult {
  * Reconstruct ordered receipt lines from an unordered list of word-level
  * OCR annotations.  Pass `detections.slice(1)` (skip the full-text block).
  *
- * Returns the receipt lines plus the estimated rotation angle.
+ * Uses Method 3 (line-first → per-line angles) to handle folds / local
+ * rotation that a single global angle would get wrong.
  */
 export function reconstructLines(
   annotations: TextAnnotation[],
@@ -440,49 +572,80 @@ export function reconstructLines(
       .filter((w) => w > 0),
   );
 
-  // ── Stage 1: global rotation ──────────────────────────────────────────
-  const angle = estimateGlobalAngle(boxes);
+  // ── Stage 1a: build tentative lines via neighbor graph ────────────────
+  const tentativeLines = buildTentativeLines(boxes, medH);
 
-  // ── Stage 2: rotate & cluster ─────────────────────────────────────────
-  const rotated = rotateBoxes(boxes, angle);
-  const rawLines = clusterIntoLines(rotated, medH);
+  // ── Stage 1b: compute per-line angles ─────────────────────────────────
+  const lineAngles = tentativeLines.map((line) => computeLineAngle(line));
 
-  // ── Stage 3: RANSAC-split oversized clusters ──────────────────────────
-  const splitLines: RotatedBox[][] = [];
-  for (const cluster of rawLines) {
-    splitLines.push(...ransacSplitCluster(cluster, medH));
+  // ── Stage 1c: global angle fallback for singletons ────────────────────
+  const validAngles = lineAngles.filter((a) => a !== 0);
+  const globalAngle =
+    validAngles.length > 0
+      ? median(validAngles)
+      : estimateGlobalAngle(boxes);
+  const resolvedAngles = lineAngles.map((a) => (a === 0 ? globalAngle : a));
+
+  // ── Stage 2: per-line rotation + RANSAC split ─────────────────────────
+  interface LineBucket {
+    boxes: RotatedBox[];
+    angle: number;
+  }
+  const finalBuckets: LineBucket[] = [];
+
+  for (let i = 0; i < tentativeLines.length; i++) {
+    const angle = resolvedAngles[i];
+    const rotated = rotateBoxes(tentativeLines[i], angle);
+    const splits = ransacSplitCluster(rotated, medH);
+    for (const split of splits) {
+      finalBuckets.push({ boxes: split, angle });
+    }
   }
 
-  // ── Stage 4: order words left → right ─────────────────────────────────
-  const orderedLines = splitLines.map((line) => orderWordsInLine(line));
+  // ── Stage 3: order words left → right ─────────────────────────────────
+  const orderedBuckets = finalBuckets.map(({ boxes: bxs, angle }) => ({
+    ordered: orderWordsInLine(bxs),
+    angle,
+  }));
 
-  // ── Detect the price column ───────────────────────────────────────────
-  const priceColX = detectPriceColumnX(orderedLines);
+  // ── Stage 4: price column detection & assignment ──────────────────────
+  const priceColX = detectPriceColumnX(
+    orderedBuckets.map((b) => b.ordered),
+  );
 
-  // ── Stage 5: build ReceiptLine objects ─────────────────────────────────
-  const receiptLines: ReceiptLine[] = orderedLines.map((ordered) => {
-    const text = buildLineText(ordered, charW);
-    const { price, priceIndex } = assignPrice(ordered, priceColX, medH);
+  const receiptLines: ReceiptLine[] = orderedBuckets.map(
+    ({ ordered, angle }) => {
+      const text = buildLineText(ordered, charW);
+      const { price, priceIndex } = assignPrice(ordered, priceColX, medH);
 
-    // Item name = everything to the left of the price token
-    const itemName =
-      priceIndex >= 0
-        ? buildLineText(ordered.slice(0, priceIndex), charW).trim()
-        : text.trim();
+      const itemName =
+        priceIndex >= 0
+          ? buildLineText(ordered.slice(0, priceIndex), charW).trim()
+          : text.trim();
 
-    const lineType = classifyLine(text, price !== null);
+      const lineType = classifyLine(text, price);
 
-    return {
-      words: ordered,
-      text,
-      itemName: itemName || null,
-      price,
-      lineType,
-    };
+      return {
+        words: ordered,
+        text,
+        itemName: itemName || null,
+        price,
+        lineType,
+        angle,
+      };
+    },
+  );
+
+  // ── Stage 5: sort top → bottom by original y, then edge cases ─────────
+  receiptLines.sort((a, b) => {
+    const aY =
+      a.words.reduce((s, w) => s + w.center.y, 0) / (a.words.length || 1);
+    const bY =
+      b.words.reduce((s, w) => s + w.center.y, 0) / (b.words.length || 1);
+    return aY - bY;
   });
 
-  // ── Edge cases ────────────────────────────────────────────────────────
   handleWrappedNames(receiptLines, medH);
 
-  return { lines: receiptLines, angle };
+  return { lines: receiptLines, angle: globalAngle };
 }

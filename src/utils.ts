@@ -35,7 +35,8 @@ export interface WordBox {
 // ── Receipt-line types ────────────────────────────────────────────────────────
 
 export type LineType =
-  | 'item'
+  | 'untaxed_item'
+  | 'taxed_item'
   | 'discount'
   | 'tax'
   | 'total'
@@ -54,6 +55,8 @@ export interface ReceiptLine {
   price: string | null;
   /** Semantic classification of the line. */
   lineType: LineType;
+  /** Per-line baseline angle (radians) estimated from word positions. */
+  angle: number;
 }
 
 // ── Conversion ────────────────────────────────────────────────────────────────
@@ -124,11 +127,12 @@ export function angleBetween(a: Point, b: Point): number {
 
 /**
  * Matches common receipt price formats:
- *   4.99  $4.99  -$4.99  $4.99-  ($4.99)  $1,234.99
+ * `12.34`  `-12.34`  `12.34-`  `$1,234.56`  `-$1,234.56`  `(1,234.56)`  `($1,234.56)`  `(1,234.56)-`  `12.34 A`  `12.34-A`
  */
-const PRICE_REGEX = /^-?\(?\$?\d{1,3}(,\d{3})*\.\d{2}\)?-?$/;
+const PRICE_REGEX = /^(?:(?:-?\$?\d{1,3}(?:,\d{3})*\.\d{2})|\(\$?\d{1,3}(?:,\d{3})*\.\d{2}\))(?:-(?!A))?(?:[ -]A)?$/;
 
 export function isPrice(text: string): boolean {
+    console.log(`Checking if "${text}" is a price...`);
   return PRICE_REGEX.test(text.trim());
 }
 
@@ -146,18 +150,26 @@ const DISCOUNT_KEYWORDS = [
   'coupon',
   'promo',
 ];
+const DISCOUNT_KEYWORDS_PRICE = [
+  '-'
+];
+const TAXED_ITEM_KEYWORDS_PRICE = [
+  'A'
+];
 
 /**
  * Classify a receipt line by its text content.
  * Check order matters: "subtotal" must be checked before "total".
  */
-export function classifyLine(text: string, hasPrice: boolean): LineType {
+export function classifyLine(text: string, price: string | null): LineType {
   const lower = text.toLowerCase();
 
   if (SUBTOTAL_KEYWORDS.some((k) => lower.includes(k))) return 'subtotal';
   if (TOTAL_KEYWORDS.some((k) => lower.includes(k))) return 'total';
   if (TAX_KEYWORDS.some((k) => lower.includes(k))) return 'tax';
   if (DISCOUNT_KEYWORDS.some((k) => lower.includes(k))) return 'discount';
-  if (!hasPrice) return 'info';
-  return 'item';
+  if (!price) return 'info';
+  if (DISCOUNT_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'discount';
+  if (TAXED_ITEM_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'taxed_item';
+  return 'untaxed_item';
 }

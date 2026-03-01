@@ -204,3 +204,43 @@ export const WRAP_MAX_VERTICAL_GAP_FACTOR = 1.5;
  * slightly indented continuation lines.
  */
 export const WRAP_MAX_LEFT_ALIGN_FACTOR = 3;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Stage 1b – Neighbor-graph tentative line building (Method 3)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * **Used in:** `buildTentativeLines` – connecting two word boxes.
+ *
+ * Minimum vertical overlap between two boxes, expressed as a fraction of
+ * the smaller box's height, for them to be considered "on the same line".
+ * 0.3 (30%) is strict enough to reject boxes on adjacent lines (which
+ * typically have zero overlap because line spacing > text height) while
+ * tolerating slight skew between adjacent words.  For two words on the
+ * same line separated by a small x-gap, the y-shift due to rotation is
+ * tiny (Δy = Δx × sin θ ≈ a few pixels), so overlap stays well above 30%.
+ */
+export const NEIGHBOR_Y_OVERLAP_MIN = 0.6;
+
+/**
+ * **Used in:** `buildTentativeLines` – maximum horizontal gap.
+ *
+ * Maximum gap (in multiples of median word height) between the right edge
+ * of one box and the left edge of the next for them to be linked as
+ * neighbors.  8× is generous enough to bridge the gap between an item
+ * name and its far-right price on a typical receipt (item-to-price gaps
+ * are often 5–10× text height).  The y-overlap constraint prevents this
+ * from accidentally linking boxes on different lines.
+ */
+export const NEIGHBOR_MAX_X_GAP_FACTOR = 8;
+
+/**
+ * **Used in:** `buildTentativeLines` – height-similarity filter.
+ *
+ * Maximum ratio of the taller box's height to the shorter box's height.
+ * 2.0 allows moderate font-size variation (e.g. bold totals vs. normal
+ * items) while rejecting connections between normal text and large headers
+ * or logos.  Tighten to 1.5 if you're getting false connections to headers.
+ */
+export const NEIGHBOR_MAX_HEIGHT_RATIO = 2.0;
+

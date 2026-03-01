@@ -81,7 +81,7 @@ function mergeRotatedBoundingBox(
 function formatLineLabel(line: ReceiptLine): string {
   if (line.lineType === 'wrapped') return `\u21a9 ${line.text}`;
   if (line.price) {
-    if (line.lineType === 'item')
+    if (line.lineType === 'untaxed_item' || line.lineType === 'taxed_item')
       return `${line.itemName ?? ''} \u2192 ${line.price}`;
     return `[${line.lineType.toUpperCase()}] ${line.itemName ?? ''} ${line.price}`;
   }
@@ -164,12 +164,12 @@ async function detectTextLocal(filePath: string): Promise<void> {
 
   console.log(`\nEstimated rotation: ${(angle * 180 / Math.PI).toFixed(2)}°\n`);
 
-  // Build line annotations with rotated bounding boxes
+  // Build line annotations with per-line rotated bounding boxes
   const lineAnnotations: LineAnnotation[] = receiptLines.map((line) => ({
     description: formatLineLabel(line),
     boundingPoly: mergeRotatedBoundingBox(
       line.words.map((w) => w.original),
-      angle,
+      line.angle,
     ),
   }));
 
