@@ -1,0 +1,16 @@
+{
+  "name": "google-vision-test",
+  "version": "1.0.0",
+  "description": "Google Cloud Vision API - Image Text Detection (OCR)",
+  "main": "detect.js",
+  "scripts": {
+    "start": "node detect.js",
+    "detect:local": "node detect.js local",
+    "detect:remote": "node detect.js remote"
+  },
+  "dependencies": {
+    "@google-cloud/vision": "^4.3.2",
+    "dotenv": "^16.4.5",
+    "sharp": "^0.34.5"
+  }
+}
