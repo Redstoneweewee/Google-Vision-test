@@ -5,6 +5,9 @@ import sharp from 'sharp';
 import fs from 'fs';
 import path from 'path';
 
+import { reconstructLines } from './algorithm';
+import type { ReceiptLine } from './utils';
+
 type TextAnnotation = protos.google.cloud.vision.v1.IEntityAnnotation;
 type Vertex = protos.google.cloud.vision.v1.IVertex;
 
@@ -12,53 +15,51 @@ type Vertex = protos.google.cloud.vision.v1.IVertex;
 // Credentials are read automatically from GOOGLE_APPLICATION_CREDENTIALS env var.
 const client = new vision.ImageAnnotatorClient();
 
-interface WordBounds {
-  left: number;
-  top: number;
-  bottom: number;
-  midY: number;
-  height: number;
-}
-
 interface LineAnnotation {
   description: string;
   boundingPoly: { vertices: Required<Vertex>[] };
-}
-
-function getWordBounds(word: TextAnnotation): WordBounds {
-  const verts = word.boundingPoly?.vertices ?? [];
-  const xs = verts.map((v) => v.x ?? 0);
-  const ys = verts.map((v) => v.y ?? 0);
-  const top = Math.min(...ys);
-  const bottom = Math.max(...ys);
-  return {
-    left: Math.min(...xs),
-    top,
-    bottom,
-    midY: (top + bottom) / 2,
-    height: bottom - top,
-  };
-}
-
-/**
- * Groups word annotations into lines (top-to-bottom), each line sorted L→R.
- */
-function groupIntoLines(words: TextAnnotation[]): TextAnnotation[][] {
-  // STUB: each word is its own "line"
-  return words.map((w) => [w]);
 }
 
 /**
  * Merges all word bounding boxes in a line into one axis-aligned rectangle.
  */
 function mergeLineBoundingBox(
-  lineWords: TextAnnotation[]
+  lineWords: TextAnnotation[],
 ): LineAnnotation['boundingPoly'] {
-  // STUB: return the single word's own bounding poly
-  const verts = lineWords[0]?.boundingPoly?.vertices ?? [];
+  const allVerts = lineWords.flatMap((w) => w.boundingPoly?.vertices ?? []);
+  if (allVerts.length === 0) {
+    const zero = { x: 0, y: 0 } as Required<Vertex>;
+    return { vertices: [zero, zero, zero, zero] };
+  }
+
+  const xs = allVerts.map((v) => v.x ?? 0);
+  const ys = allVerts.map((v) => v.y ?? 0);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
   return {
-    vertices: verts.map((v) => ({ x: v.x ?? 0, y: v.y ?? 0 })) as Required<Vertex>[],
+    vertices: [
+      { x: minX, y: minY },
+      { x: maxX, y: minY },
+      { x: maxX, y: maxY },
+      { x: minX, y: maxY },
+    ] as Required<Vertex>[],
   };
+}
+
+/**
+ * Produce a short label for the annotated-image overlay.
+ */
+function formatLineLabel(line: ReceiptLine): string {
+  if (line.lineType === 'wrapped') return `\u21a9 ${line.text}`;
+  if (line.price) {
+    if (line.lineType === 'item')
+      return `${line.itemName ?? ''} \u2192 ${line.price}`;
+    return `[${line.lineType.toUpperCase()}] ${line.itemName ?? ''} ${line.price}`;
+  }
+  return line.text;
 }
 
 /**
@@ -132,19 +133,34 @@ async function detectTextLocal(filePath: string): Promise<void> {
   console.log('=== Full detected text ===');
   console.log(detections[0].description);
 
-  // Group words into lines, merge bounding boxes
-  const lines = groupIntoLines(detections.slice(1));
-  const lineAnnotations: LineAnnotation[] = lines.map((lineWords) => ({
-    description: lineWords.map((w) => w.description ?? '').join(' '),
-    boundingPoly: mergeLineBoundingBox(lineWords),
+  // Reconstruct receipt lines using the hybrid algorithm
+  const receiptLines = reconstructLines(detections.slice(1));
+
+  // Build line annotations for the annotated-image overlay
+  const lineAnnotations: LineAnnotation[] = receiptLines.map((line) => ({
+    description: formatLineLabel(line),
+    boundingPoly: mergeLineBoundingBox(
+      line.words.map((w) => w.original),
+    ),
   }));
 
-  console.log('\n=== Lines (L→R, merged bounding box) ===');
-  lineAnnotations.forEach(({ description, boundingPoly: { vertices: v } }, i) => {
-    const box = `(${v[0].x},${v[0].y}) → (${v[1].x},${v[1].y}) → (${v[2].x},${v[2].y}) → (${v[3].x},${v[3].y})`;
-    console.log(`Line ${i + 1}: "${description}"`);
-    console.log(`         Box: [${box}]`);
-  });
+  console.log('\n=== Reconstructed Lines ===');
+  lineAnnotations.forEach(
+    ({ description, boundingPoly: { vertices: v } }, i) => {
+      const box = `(${v[0].x},${v[0].y}) \u2192 (${v[1].x},${v[1].y}) \u2192 (${v[2].x},${v[2].y}) \u2192 (${v[3].x},${v[3].y})`;
+      console.log(`Line ${i + 1}: "${description}"`);
+      console.log(`         Box: [${box}]`);
+    },
+  );
+
+  console.log('\n=== Parsed Receipt ===');
+  for (const line of receiptLines) {
+    if (line.lineType === 'wrapped') continue;
+    const tag = `[${line.lineType.toUpperCase()}]`.padEnd(12);
+    const name = (line.itemName ?? line.text).padEnd(35);
+    const price = line.price ?? '';
+    console.log(`  ${tag} ${name} ${price}`);
+  }
 
   await saveAnnotatedImage(resolvedPath, lineAnnotations);
 }
@@ -168,18 +184,22 @@ async function detectTextRemote(imageUri: string): Promise<void> {
   console.log('=== Full detected text ===');
   console.log(detections[0].description);
 
-  const lines = groupIntoLines(detections.slice(1));
-  const lineAnnotations: LineAnnotation[] = lines.map((lineWords) => ({
-    description: lineWords.map((w) => w.description ?? '').join(' '),
-    boundingPoly: mergeLineBoundingBox(lineWords),
-  }));
+  // Reconstruct receipt lines using the hybrid algorithm
+  const receiptLines = reconstructLines(detections.slice(1));
 
-  console.log('\n=== Lines (L→R, merged bounding box) ===');
-  lineAnnotations.forEach(({ description, boundingPoly: { vertices: v } }, i) => {
-    const box = `(${v[0].x},${v[0].y}) → (${v[1].x},${v[1].y}) → (${v[2].x},${v[2].y}) → (${v[3].x},${v[3].y})`;
-    console.log(`Line ${i + 1}: "${description}"`);
-    console.log(`         Box: [${box}]`);
+  console.log('\n=== Reconstructed Lines ===');
+  receiptLines.forEach((line, i) => {
+    console.log(`Line ${i + 1}: "${line.text}"`);
   });
+
+  console.log('\n=== Parsed Receipt ===');
+  for (const line of receiptLines) {
+    if (line.lineType === 'wrapped') continue;
+    const tag = `[${line.lineType.toUpperCase()}]`.padEnd(12);
+    const name = (line.itemName ?? line.text).padEnd(35);
+    const price = line.price ?? '';
+    console.log(`  ${tag} ${name} ${price}`);
+  }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
