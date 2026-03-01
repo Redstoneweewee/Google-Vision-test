@@ -6,7 +6,9 @@ import fs from 'fs';
 import path from 'path';
 
 import { reconstructLines } from './algorithm';
-import type { ReceiptLine } from './utils';
+import type { ReconstructionResult } from './algorithm';
+import type { ReceiptLine, Point } from './utils';
+import { rotatePoint } from './utils';
 
 type TextAnnotation = protos.google.cloud.vision.v1.IEntityAnnotation;
 type Vertex = protos.google.cloud.vision.v1.IVertex;
@@ -21,31 +23,55 @@ interface LineAnnotation {
 }
 
 /**
- * Merges all word bounding boxes in a line into one axis-aligned rectangle.
+ * Builds a rotated bounding box for a line:
+ *   1. Collect all original vertices from every word in the line.
+ *   2. Rotate them by −θ into the straightened coordinate system.
+ *   3. Compute the axis-aligned bounding box in that space.
+ *   4. Rotate the 4 AABB corners back by +θ into image space.
+ *
+ * The result is a tilted rectangle that follows the text baseline.
  */
-function mergeLineBoundingBox(
+function mergeRotatedBoundingBox(
   lineWords: TextAnnotation[],
+  angle: number,
 ): LineAnnotation['boundingPoly'] {
-  const allVerts = lineWords.flatMap((w) => w.boundingPoly?.vertices ?? []);
+  const allVerts = lineWords.flatMap((w) =>
+    (w.boundingPoly?.vertices ?? []).map((v) => ({
+      x: v.x ?? 0,
+      y: v.y ?? 0,
+    })),
+  );
+
   if (allVerts.length === 0) {
     const zero = { x: 0, y: 0 } as Required<Vertex>;
     return { vertices: [zero, zero, zero, zero] };
   }
 
-  const xs = allVerts.map((v) => v.x ?? 0);
-  const ys = allVerts.map((v) => v.y ?? 0);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
+  // Rotate into straightened space
+  const rotated = allVerts.map((v) => rotatePoint(v, -angle));
+  const rxs = rotated.map((v) => v.x);
+  const rys = rotated.map((v) => v.y);
+  const minX = Math.min(...rxs);
+  const maxX = Math.max(...rxs);
+  const minY = Math.min(...rys);
+  const maxY = Math.max(...rys);
+
+  // AABB corners in rotated space (TL, TR, BR, BL)
+  const corners: Point[] = [
+    { x: minX, y: minY },
+    { x: maxX, y: minY },
+    { x: maxX, y: maxY },
+    { x: minX, y: maxY },
+  ];
+
+  // Rotate back into image space
+  const imageCorners = corners.map((c) => rotatePoint(c, angle));
 
   return {
-    vertices: [
-      { x: minX, y: minY },
-      { x: maxX, y: minY },
-      { x: maxX, y: maxY },
-      { x: minX, y: maxY },
-    ] as Required<Vertex>[],
+    vertices: imageCorners.map((c) => ({
+      x: Math.round(c.x),
+      y: Math.round(c.y),
+    })) as Required<Vertex>[],
   };
 }
 
@@ -134,13 +160,16 @@ async function detectTextLocal(filePath: string): Promise<void> {
   console.log(detections[0].description);
 
   // Reconstruct receipt lines using the hybrid algorithm
-  const receiptLines = reconstructLines(detections.slice(1));
+  const { lines: receiptLines, angle } = reconstructLines(detections.slice(1));
 
-  // Build line annotations for the annotated-image overlay
+  console.log(`\nEstimated rotation: ${(angle * 180 / Math.PI).toFixed(2)}°\n`);
+
+  // Build line annotations with rotated bounding boxes
   const lineAnnotations: LineAnnotation[] = receiptLines.map((line) => ({
     description: formatLineLabel(line),
-    boundingPoly: mergeLineBoundingBox(
+    boundingPoly: mergeRotatedBoundingBox(
       line.words.map((w) => w.original),
+      angle,
     ),
   }));
 
@@ -185,7 +214,9 @@ async function detectTextRemote(imageUri: string): Promise<void> {
   console.log(detections[0].description);
 
   // Reconstruct receipt lines using the hybrid algorithm
-  const receiptLines = reconstructLines(detections.slice(1));
+  const { lines: receiptLines, angle } = reconstructLines(detections.slice(1));
+
+  console.log(`\nEstimated rotation: ${(angle * 180 / Math.PI).toFixed(2)}°\n`);
 
   console.log('\n=== Reconstructed Lines ===');
   receiptLines.forEach((line, i) => {

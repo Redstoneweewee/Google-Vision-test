@@ -412,17 +412,24 @@ function handleWrappedNames(lines: ReceiptLine[], medH: number): void {
    Public entry point
    ═══════════════════════════════════════════════════════════════════════════ */
 
+export interface ReconstructionResult {
+  /** Ordered receipt lines, top-to-bottom. */
+  lines: ReceiptLine[];
+  /** The global rotation angle (radians) estimated in Stage 1. */
+  angle: number;
+}
+
 /**
  * Reconstruct ordered receipt lines from an unordered list of word-level
  * OCR annotations.  Pass `detections.slice(1)` (skip the full-text block).
  *
- * Returns one `ReceiptLine` per visual line, top-to-bottom.
+ * Returns the receipt lines plus the estimated rotation angle.
  */
 export function reconstructLines(
   annotations: TextAnnotation[],
-): ReceiptLine[] {
+): ReconstructionResult {
   const boxes = annotations.map(annotationToWordBox);
-  if (boxes.length === 0) return [];
+  if (boxes.length === 0) return { lines: [], angle: 0 };
 
   const medH = median(boxes.map((b) => b.height));
 
@@ -477,5 +484,5 @@ export function reconstructLines(
   // ── Edge cases ────────────────────────────────────────────────────────
   handleWrappedNames(receiptLines, medH);
 
-  return receiptLines;
+  return { lines: receiptLines, angle };
 }
