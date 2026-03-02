@@ -471,7 +471,7 @@ function detectPriceColumnX(allLines: RotatedBox[][]): number | null {
   const priceRights: number[] = [];
   for (const line of allLines) {
     for (const box of line) {
-      if (isPrice(box.text)) priceRights.push(box.rRight);
+      if (isPrice(box.text)) priceRights.push(box.right);
     }
   }
   return priceRights.length >= PRICE_COLUMN_MIN_PRICES ? median(priceRights) : null;
@@ -486,12 +486,37 @@ function assignPrice(
   for (let i = ordered.length - 1; i >= 0; i--) {
     if (!isPrice(ordered[i].text)) continue;
 
-    // If a price column was detected, verify this token is near it
+    // If a price column was detected, verify this token is near it.
+    // Use original (unrotated) right edges so that per-line angle
+    // differences don't shift the comparison — the physical right column
+    // on the receipt is consistent in image space.
     if (priceColX !== null) {
-      if (Math.abs(ordered[i].rRight - priceColX) > PRICE_COLUMN_TOLERANCE_FACTOR * medH) continue;
+      if (Math.abs(ordered[i].right - priceColX) > PRICE_COLUMN_TOLERANCE_FACTOR * medH) continue;
     }
 
-    return { price: ordered[i].text, priceIndex: i };
+    // Absorb trailing suffix tokens that OCR may have split from the price.
+    // Known suffixes: "-" (discount), "A" (taxed item), "-A" (taxed item).
+    let price = ordered[i].text.trim();
+    for (let j = i + 1; j < ordered.length && j <= i + 2; j++) {
+      const suf = ordered[j].text.trim();
+      if (!/^(-|A|-A)$/i.test(suf)) break;
+
+      // Try joining: direct concat, space, dash — pick first valid match
+      const upper = suf.toUpperCase();
+      const candidates = [
+        price + upper,
+        price + ' ' + upper,
+        price + '-' + upper,
+      ];
+      const match = candidates.find((c) => isPrice(c));
+      if (match) {
+        price = match;
+      } else {
+        break;
+      }
+    }
+
+    return { price, priceIndex: i };
   }
   return { price: null, priceIndex: -1 };
 }
@@ -535,6 +560,73 @@ function handleWrappedNames(lines: ReceiptLine[], medH: number): void {
     ) {
       nxt.itemName = [cur.text, nxt.itemName].filter(Boolean).join(' ');
       cur.lineType = 'wrapped';
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Edge case – Orphan prices for keyword lines (subtotal / tax / total)
+   ─────────────────────────────────────────────────────────────────────────
+   On many receipts the keyword ("SUBTOTAL") and its price ("281.49") are
+   far apart horizontally — often beyond the neighbor-graph's x-gap limit.
+   They end up as separate tentative lines.  After classification we detect
+   keyword lines with no price, and look for an adjacent price-only line
+   (a line whose entire text is the price with no item name) immediately
+   below.  If found, the price is absorbed into the keyword line and the
+   orphan is hidden.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function mergeOrphanPrices(lines: ReceiptLine[], medH: number): void {
+  for (let i = 0; i < lines.length; i++) {
+    const cur = lines[i];
+
+    // Only apply to keyword lines that have no price
+    if (!['subtotal', 'tax', 'total'].includes(cur.lineType) || cur.price !== null) continue;
+    if (cur.words.length === 0) continue;
+
+    const curTop = Math.min(...cur.words.map((w) => w.top));
+    const curBottom = Math.max(...cur.words.map((w) => w.bottom));
+
+    // ── Try the line BELOW first (original logic) ───────────────────────
+    if (i < lines.length - 1) {
+      const nxt = lines[i + 1];
+      if (
+        nxt.price !== null &&
+        nxt.lineType !== 'wrapped' &&
+        nxt.itemName === null &&
+        nxt.words.length > 0
+      ) {
+        const nxtTop = Math.min(...nxt.words.map((w) => w.top));
+        if (nxtTop - curBottom <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
+          cur.price = nxt.price;
+          cur.text = cur.text + ' ' + nxt.text;
+          cur.words = [...cur.words, ...nxt.words];
+          cur.lineType = classifyLine(cur.text, cur.price);
+          nxt.lineType = 'wrapped';
+          continue;
+        }
+      }
+    }
+
+    // ── Try the line ABOVE (handles price-before-keyword layout) ────────
+    if (i > 0) {
+      const prev = lines[i - 1];
+      if (
+        prev.price !== null &&
+        prev.lineType !== 'wrapped' &&
+        prev.itemName === null &&
+        prev.words.length > 0
+      ) {
+        const prevBottom = Math.max(...prev.words.map((w) => w.bottom));
+        if (curTop - prevBottom <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
+          cur.price = prev.price;
+          cur.text = prev.text + ' ' + cur.text;
+          cur.words = [...prev.words, ...cur.words];
+          cur.lineType = classifyLine(cur.text, cur.price);
+          prev.lineType = 'wrapped';
+          continue;
+        }
+      }
     }
   }
 }
@@ -645,6 +737,7 @@ export function reconstructLines(
     return aY - bY;
   });
 
+  mergeOrphanPrices(receiptLines, medH);
   handleWrappedNames(receiptLines, medH);
 
   return { lines: receiptLines, angle: globalAngle };

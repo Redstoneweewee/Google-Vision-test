@@ -65,9 +65,9 @@ Raw OCR word boxes (unordered)
  └──────────┬───────────────────┘
             ▼
  ┌──────────────────────────────┐
- │  Stage 5: Sort, wrap, edge   │  Sort top→bottom by original Y;
- │  cases                       │  merge wrapped names; tag tax/total
- └──────────┘───────────────────┘
+ │  Stage 5: Sort, merge, edge  │  Sort top→bottom by original Y;
+ │  cases                       │  merge orphan prices into keyword
+ └──────────┬───────────────────┘  lines; merge wrapped names
             ▼
       ReceiptLine[]
       (each with its own angle)
@@ -148,13 +148,16 @@ Raw OCR word boxes (unordered)
 **Goal:** Identify which token on each line is the price (not a quantity, date, or phone number).
 
 **Method:**
-1. Find all tokens matching the price regex (`$4.99`, `-$1.50`, `($3.00)`, etc.).
-2. Collect their **rotated** right-edge X positions and take the median — this is the "price column".
-3. For each line, walk tokens right-to-left. The first price-matching token whose right edge is near the column (within 3× median height) is the price. Everything to its left is the item name.
+1. Find all tokens matching the price regex (see below).
+2. Collect their **original image** right-edge X positions (`box.right`, not per-line-rotated `rRight`) and take the median — this is the "price column".
+3. For each line, walk tokens right-to-left. The first price-matching token whose **original** right edge is near the column (within 3× median height) is the price. Everything to its left is the item name.
+4. **Suffix absorption:** after finding a price token, the algorithm checks the next 1–2 word boxes to the right for OCR-split suffixes (`-`, `A`, or `-A`). If appending the suffix (with direct concatenation, a space, or a dash) produces a valid price string, the suffix is absorbed into the price. This handles cases like `"4.99" + "A"` → `"4.99 A"` or `"1.00" + "-" + "A"` → `"1.00-A"`.
 
 **Why detect a column?** Receipts universally right-align prices. Once you know the column's X position, you can distinguish `"4.50"` (a price at x=500) from `"2.00"` in `"2.00 KG CHICKEN"` (a quantity at x=120).
 
-**Don't per-line angles break cross-line price column detection?** No. The `rRight` values are rotated by slightly different per-line angles, but the tolerance (`PRICE_COLUMN_TOLERANCE_FACTOR = 3`, i.e. 3× median height ≈ 60px) easily absorbs the spread. For angle differences of a few degrees across lines, the resulting `rRight` spread is ~25px — well within tolerance.
+**Why use original image coordinates instead of rotated ones?** Per-line angles cause each line's rotated X values to shift differently — especially for lines near the bottom of the image where even small angle differences produce large X offsets (Δx ≈ y × sin(Δθ)). Original image coordinates are consistent because the physical right-alignment of prices on the receipt doesn't depend on the rotation correction. The 3× tolerance easily absorbs the natural ~20px spread from receipt tilt.
+
+**Price regex:** Matches `12.34`, `-12.34`, `$12.34`, `12.34-`, `12.34 A`, `12.34-A`, `($12.34)`, `$1,234.56`, and variants. The trailing `-` indicates a discount; the trailing `A` indicates a taxed item.
 
 ### Edge Cases
 
@@ -169,8 +172,21 @@ When detected, the text from the wrapped line is prepended to the next line's `i
 
 **The algorithm iterates bottom-up** so chained wraps (2+ continuation lines for one item) cascade correctly.
 
+#### Orphan Prices for Keyword Lines (Subtotal / Tax / Total)
+On many receipts the keyword (`SUBTOTAL`) and its price (`281.49`) sit far apart horizontally — often beyond the neighbor-graph's x-gap limit. They end up as separate tentative lines: one keyword-only line (classified as subtotal/tax/total with no price) and one price-only line (classified as an item because its text is just a number).
+
+After sorting and classification, `mergeOrphanPrices` scans for keyword lines with no price. For each, it checks the very next line. If that line:
+- Has a price
+- Has no meaningful item name (`itemName === null`, meaning the entire text *is* the price)
+- Is vertically close (< 1.5× median height gap)
+
+…the price and words are absorbed into the keyword line, and the orphan is tagged `"wrapped"` so it's hidden from output.
+
 #### Discount / Tax / Total Lines
-Classified by keyword matching on the full line text. Check order matters — `"subtotal"` is checked before `"total"` to avoid `"SUBTOTAL"` being tagged as a `total` line.
+Classified by keyword matching on the full line text. Check order matters — `"subtotal"` is checked before `"total"` to avoid `"SUBTOTAL"` being tagged as a `total` line. After keyword checks, the **price content** is inspected:
+- A trailing `-` in the price → `discount` (e.g. `"1.00-"`, `"1.00-A"`)
+- A trailing `A` in the price → `taxed_item` (e.g. `"4.99 A"`)
+- Otherwise → `untaxed_item`
 
 Keywords recognized:
 - **Subtotal:** subtotal, sub-total, sub total
@@ -235,14 +251,124 @@ All magic numbers live in `src/constants.ts`. Here's every constant, its current
 | Constant | Value | Effect of increasing | Effect of decreasing |
 |---|---|---|---|
 | `PRICE_COLUMN_MIN_PRICES` | `2` | Needs more prices to establish a column → more robust but may miss single-item receipts | Accept a single price as a "column" → fragile, the column position is just one data point |
-| `PRICE_COLUMN_TOLERANCE_FACTOR` | `3` | Accepts prices further from the detected column → tolerates perspective spread + per-line angle variation, but may pick up stray numbers | Strict column check → precise but may reject legitimate prices that are slightly offset |
+| `PRICE_COLUMN_TOLERANCE_FACTOR` | `3` | Accepts prices further from the detected column → tolerates natural spread in original image coordinates, but may pick up stray numbers | Strict column check → precise but may reject legitimate prices that are slightly offset |
 
-### Stage 5 — Wrapped Names
+> **Note:** Both `detectPriceColumnX` and `assignPrice` use **original image** right edges (`box.right`), not per-line-rotated `rRight`, to avoid angle-dependent spread across lines.
+
+### Stage 5 — Wrapped Names & Orphan Prices
 
 | Constant | Value | Effect of increasing | Effect of decreasing |
 |---|---|---|---|
-| `WRAP_MAX_VERTICAL_GAP_FACTOR` | `1.5` | Allows wrapping across larger vertical gaps → catches widely-spaced continuations, but may falsely merge unrelated lines | Only merges lines that are immediately adjacent → misses wraps with extra padding |
+| `WRAP_MAX_VERTICAL_GAP_FACTOR` | `1.5` | Allows wrapping / orphan-price merging across larger vertical gaps → catches widely-spaced continuations, but may falsely merge unrelated lines | Only merges lines that are immediately adjacent → misses wraps with extra padding |
 | `WRAP_MAX_LEFT_ALIGN_FACTOR` | `3` | Permits significant horizontal offset → catches indented continuations, but may match unrelated lines | Requires near-exact left alignment → misses indented or slightly shifted continuations |
+
+> **Note:** `WRAP_MAX_VERTICAL_GAP_FACTOR` is reused by `mergeOrphanPrices` for the vertical proximity check between a keyword line and its orphan price line.
+
+---
+
+## Receipt Object & Confidence Checks
+
+After the pipeline produces `ReceiptLine[]`, `detectTextLocal` in `detect.ts` builds a fully parsed `Receipt` object that provides item-level data, aggregate totals, and a confidence report.
+
+### Item Building (`buildItems`)
+
+Visible lines (excluding `wrapped`) are iterated in order:
+- `untaxed_item` / `taxed_item` → creates a `ReceiptItem` with `originalPrice`, `taxed` flag.
+- `discount` → applied to the **item immediately above** (the last item in the list). The discount amount (always negative from `parsePrice`) is accumulated in `item.discount`, and `finalPrice = originalPrice + discount`.
+
+### Price Parsing (`parsePrice`)
+
+Extracts a numeric value from raw OCR price strings:
+- `$12.34` → `12.34`
+- `12.34-` → `-12.34` (trailing minus = discount)
+- `($3.00)` → `-3.00` (accounting-style parentheses)
+- `1.00-A` → `-1.00` (discount + taxed suffix)
+- `12.34 A` → `12.34` (taxed item, positive price)
+
+### OCR Summary Extraction
+
+Three values are extracted from classified receipt lines (null if not found):
+- `ocrSubtotal` — from the first `subtotal` line with a price
+- `ocrTax` — from the first `tax` line with a price
+- `ocrTotal` — from the first `total` line with a price
+
+### Tax Rate Inference
+
+The tax rate is inferred in two ways (first match wins):
+1. `taxRate = ocrTax / taxedItemsValue` if both exist and `taxedItemsValue > 0`
+2. `taxRate = (ocrTotal - ocrSubtotal) / taxedItemsValue` if subtotal and total exist but tax line doesn't
+
+### Composable Confidence Checks
+
+The confidence system follows a **composable-rules architecture**: each check is a small, independent function that returns a `CheckResult` with:
+- `id` — machine-readable identifier
+- `severity` — `info` (passed), `warn` (suspicious), `error` (definite mismatch)
+- `message` — human-readable explanation
+- `delta` — dollar amount the check is off by (optional)
+- `penalty` — numeric score for overall confidence computation
+
+Checks that require missing OCR values return `null` (skipped).
+
+#### Check 1: `total_eq_subtotal_plus_tax`
+**Equation:** `T ≈ S + X`
+**Purpose:** Do the three OCR summary lines agree internally?
+**Requires:** ocrTotal, ocrSubtotal, ocrTax all present.
+
+#### Check 2: `taxability_balance`
+**Equation:** `TaxedBase + UntaxedBase ≈ S` (or `T - X` as fallback reference)
+**Purpose:** Do the taxable/untaxable item sums match the reference subtotal?
+**Requires:** At least ocrSubtotal or both ocrTotal and ocrTax.
+
+#### Check 3: `calc_subtotal_vs_ocr_subtotal`
+**Equation:** `sum(items after discounts) ≈ S`
+**Purpose:** Did we find all the items? Directional: tells whether items are missing or extra.
+**Requires:** ocrSubtotal present.
+
+#### Check 4: `calc_subtotal_vs_total_minus_tax`
+**Equation:** `sum(items after discounts) ≈ T - X` (or just `T` if no tax line)
+**Purpose:** Cross-check via total & tax. Catches issues when subtotal line is missing.
+**Requires:** ocrTotal present.
+
+#### Check 5: `tax_consistency`
+**Equation:** `X ≈ TaxedBase × R` (using `round_to_cents`)
+**Purpose:** Tax amount matches what we'd expect from the tax rate × taxed items.
+**Requires:** ocrTax, taxRate, and taxedItemsValue > 0.
+
+#### Check 6: `tax_rate_plausibility`
+**Condition:** `0% ≤ R ≤ 15%`
+**Purpose:** Is the inferred tax rate within a plausible US range? Outliers suggest taxability misclassification or OCR errors.
+**Requires:** taxRate computed.
+
+#### Check 7: `missing_item_estimate` / `missing_discount_estimate`
+**Equation:** `diff = reference_subtotal - calculatedSubtotal`
+**Purpose:** If there's a mismatch, estimate what's missing and whether it looks like a plausible dollar amount (2 decimal places).
+- `diff > 0` → likely missing item(s) of ~`$diff`
+- `diff < 0` → likely missing discount of ~`$|diff|`
+**Requires:** At least one reference subtotal available, and a non-zero mismatch.
+
+#### Check 8: `missing_subtotal` / `missing_tax` / `missing_total`
+**Purpose:** Note which OCR summary lines couldn't be found. Missing lines reduce the number of cross-checks possible, lowering the confidence ceiling.
+
+### Overall Confidence Score (0–1)
+
+The overall score combines three factors:
+
+1. **Fit quality:** `exp(-totalPenalty / 50)` — exponential decay from accumulated penalties. A few cents off gives ~0.95; large mismatches drive it toward 0.
+2. **Missing-data penalty:** `exp(-missingCount / 3)` — each missing summary line (subtotal/tax/total) reduces the ceiling because fewer cross-checks are possible.
+3. **Severity cap:** Any `error`-severity check caps the score at 0.6; any `warn` caps at 0.85.
+
+Final: `min(fitQuality × missingPenalty, severityCap)`
+
+### Legacy Boolean Flags
+
+For backward compatibility, three boolean flags are derived from the composable checks:
+- `totalMinusTaxEqualsOcrSubtotal` — `true` if check 1 passes, `null` if not applicable
+- `calculatedSubtotalEqualsOcrSubtotal` — `true` if check 3 passes, `null` if not applicable
+- `calculatedSubtotalEqualsTotalMinusTax` — `true` if check 4 passes, `null` if not applicable
+
+### Tolerance
+
+All dollar-amount comparisons use a tolerance of `$0.015` (`CENTS_TOLERANCE`). This handles floating-point imprecision and rounding differences between per-line tax computation vs. global tax computation.
 
 ---
 
@@ -251,24 +377,32 @@ All magic numbers live in `src/constants.ts`. Here's every constant, its current
 ```
 src/
 ├── constants.ts   ← All tunable magic numbers (this doc's "Constants Reference")
-├── utils.ts       ← Shared types (WordBox, ReceiptLine with per-line angle,
-│                     Point, LineType) + pure helpers (median, rotatePoint,
-│                     angleBetween, isPrice, classifyLine, annotationToWordBox)
+├── utils.ts       ← Shared types (WordBox, ReceiptLine, Point, LineType,
+│                     ReceiptItem, ReceiptConfidence, Receipt, CheckResult,
+│                     Severity) + pure helpers (median, rotatePoint,
+│                     angleBetween, isPrice, classifyLine, parsePrice,
+│                     annotationToWordBox)
 ├── algorithm.ts   ← Method 3 pipeline: neighbor graph → per-line angles →
 │                     RANSAC → price column (reconstructLines entry point)
 │                     Includes UnionFind, buildTentativeLines, computeLineAngle,
 │                     estimateGlobalAngle (fallback), rotateBoxes, ransacSplitCluster
-└── detect.ts      ← Google Vision API calls, console output, image annotation
-                      with per-line rotated bounding boxes
+└── detect.ts      ← Google Vision API calls, Receipt building, composable
+                      confidence checks (8 check functions + scoring),
+                      image annotation with per-line rotated bounding boxes
 ```
 
 ### How to modify
 
 - **Change a threshold:** Edit the value in `constants.ts`. The JSDoc on each constant tells you exactly which function uses it.
 - **Add a new keyword category:** Add the keywords array in `utils.ts` and add the new `LineType` variant + check in `classifyLine`.
-- **Change the price regex:** Edit `PRICE_REGEX` in `utils.ts`. The regex is intentionally strict (requires exactly 2 decimal places) to avoid matching dates, phone numbers, and zip codes.
+- **Add a new price suffix:** Add the suffix pattern to the regex check inside `assignPrice` (in `algorithm.ts`) and to `PRICE_REGEX` in `utils.ts`.
+- **Change the price regex:** Edit `PRICE_REGEX` in `utils.ts`. The regex supports `12.34`, `12.34-`, `12.34 A`, `12.34-A`, with optional `$`, commas, leading `-`, and parentheses.
+- **Change line type names:** Update the `LineType` union in `utils.ts`. Current types: `untaxed_item`, `taxed_item`, `discount`, `tax`, `total`, `subtotal`, `info`, `wrapped`.
+- **Add a new confidence check:** Write a function `checkFoo(ctx: CheckContext): CheckResult | null` in `detect.ts` and add it to the `allChecks` array inside `checkConfidence`. Follow the pattern: return `null` if required values are missing, otherwise return a `CheckResult` with id, severity, message, delta, and penalty.
+- **Tune confidence scoring:** Adjust penalty multipliers in individual check functions, `CENTS_TOLERANCE` for comparison tolerance, or the exponential decay divisor (currently `50`) in `computeOverallScore`.
 - **Skip RANSAC entirely:** Set `RANSAC_SPLIT_THRESHOLD_FACTOR` to `Infinity` — clusters will never trigger the split.
 - **Disable wrapped-name merging:** Set `WRAP_MAX_VERTICAL_GAP_FACTOR` to `0`.
+- **Disable orphan-price merging:** Remove the `mergeOrphanPrices` call in `reconstructLines`.
 
 ---
 

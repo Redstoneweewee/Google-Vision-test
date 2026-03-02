@@ -7,8 +7,9 @@ import path from 'path';
 
 import { reconstructLines } from './algorithm';
 import type { ReconstructionResult } from './algorithm';
-import type { ReceiptLine, Point } from './utils';
-import { rotatePoint } from './utils';
+import type { ReceiptLine, Point, Receipt, ReceiptItem, ReceiptConfidence } from './utils';
+import { rotatePoint, parsePrice } from './utils';
+import { checkConfidence, formatConfidenceReport, colorBold, colorDim, colorPass, colorWarn, colorError, colorCyan } from './checks';
 
 type TextAnnotation = protos.google.cloud.vision.v1.IEntityAnnotation;
 type Vertex = protos.google.cloud.vision.v1.IVertex;
@@ -136,35 +137,115 @@ async function saveAnnotatedImage(
 }
 
 /**
- * Detects text in a local image file, logs lines L→R, and saves an annotated copy.
+ * Build the list of ReceiptItems from classified lines.
+ * Discount lines are applied to the item immediately above them.
  */
-async function detectTextLocal(filePath: string): Promise<void> {
+function buildItems(lines: ReceiptLine[]): ReceiptItem[] {
+  const items: ReceiptItem[] = [];
+  const visibleLines = lines.filter((l) => l.lineType !== 'wrapped');
+
+  for (let i = 0; i < visibleLines.length; i++) {
+    const line = visibleLines[i];
+
+    if (line.lineType === 'untaxed_item' || line.lineType === 'taxed_item') {
+      const originalPrice = Math.abs(parsePrice(line.price));
+      items.push({
+        name: line.itemName ?? line.text,
+        originalPrice,
+        discount: 0,
+        finalPrice: originalPrice,
+        taxed: line.lineType === 'taxed_item',
+        rawPrice: line.price ?? '',
+        rawDiscount: null,
+      });
+    } else if (line.lineType === 'discount') {
+      const discountValue = parsePrice(line.price); // negative
+      if (items.length > 0) {
+        const target = items[items.length - 1];
+        target.discount += discountValue;
+        target.finalPrice = target.originalPrice + target.discount;
+        target.rawDiscount = target.rawDiscount
+          ? target.rawDiscount + ', ' + (line.price ?? '')
+          : (line.price ?? '');
+      }
+    }
+  }
+
+  return items;
+}
+
+/**
+ * Detects text in a local image file, reconstructs receipt lines, and
+ * returns a fully parsed Receipt object.  Also saves an annotated image.
+ */
+export async function detectTextLocal(filePath: string): Promise<Receipt> {
   const resolvedPath = path.resolve(filePath);
 
   if (!fs.existsSync(resolvedPath)) {
-    console.error(`File not found: ${resolvedPath}`);
-    process.exit(1);
+    throw new Error(`File not found: ${resolvedPath}`);
   }
-
-  console.log(`\nDetecting text in local image: ${resolvedPath}\n`);
 
   const [result] = await client.textDetection(resolvedPath);
   const detections = result.textAnnotations;
 
   if (!detections || detections.length === 0) {
-    console.log('No text detected.');
-    return;
+    throw new Error('No text detected in image.');
   }
 
-  console.log('=== Full detected text ===');
-  console.log(detections[0].description);
-
-  // Reconstruct receipt lines using the hybrid algorithm
+  // ── Reconstruct receipt lines ─────────────────────────────────────────
   const { lines: receiptLines, angle } = reconstructLines(detections.slice(1));
 
-  console.log(`\nEstimated rotation: ${(angle * 180 / Math.PI).toFixed(2)}°\n`);
+  // ── Build items (with discounts applied) ──────────────────────────────
+  const items = buildItems(receiptLines);
 
-  // Build line annotations with per-line rotated bounding boxes
+  // ── Counts ────────────────────────────────────────────────────────────
+  const totalLines = receiptLines.filter((l) => l.lineType !== 'wrapped').length;
+  const untaxedItems = items.filter((i) => !i.taxed);
+  const taxedItems = items.filter((i) => i.taxed);
+
+  const untaxedItemsValue = untaxedItems.reduce((s, i) => s + i.finalPrice, 0);
+  const taxedItemsValue = taxedItems.reduce((s, i) => s + i.finalPrice, 0);
+
+  // ── OCR summary values ────────────────────────────────────────────────
+  const findOcrValue = (type: string): number | null => {
+    const line = receiptLines.find(
+      (l) => l.lineType === type && l.price !== null,
+    );
+    return line ? parsePrice(line.price) : null;
+  };
+
+  const ocrSubtotal = findOcrValue('subtotal');
+  const ocrTax = findOcrValue('tax');
+  const ocrTotal = findOcrValue('total');
+
+  // ── Tax rate ──────────────────────────────────────────────────────────
+  let taxRate: number | null = null;
+  if (ocrTax !== null && taxedItemsValue > 0) {
+    taxRate = ocrTax / taxedItemsValue;
+    console.log(`Estimated tax rate from OCR tax line: ${(taxRate * 100).toFixed(2)}%`);
+  }
+  else if(ocrSubtotal !== null && ocrTotal !== null) {
+    const impliedTax = ocrTotal - ocrSubtotal;
+    if (impliedTax > 0 && taxedItemsValue > 0) {
+      taxRate = impliedTax / taxedItemsValue;
+    }
+    console.log(`Estimated tax rate from OCR subtotal and total: ${taxRate !== null ? (taxRate * 100).toFixed(2) + '%' : '(not computable)'}`);
+  }
+
+  const calculatedSubtotal = untaxedItemsValue + taxedItemsValue;
+
+  // ── Confidence ────────────────────────────────────────────────────────
+  const confidence = checkConfidence(
+    calculatedSubtotal,
+    taxedItemsValue,
+    untaxedItemsValue,
+    ocrSubtotal,
+    ocrTax,
+    ocrTotal,
+    taxRate,
+  );
+
+  // ── Save annotated image ──────────────────────────────────────────────
   const lineAnnotations: LineAnnotation[] = receiptLines.map((line) => ({
     description: formatLineLabel(line),
     boundingPoly: mergeRotatedBoundingBox(
@@ -172,81 +253,74 @@ async function detectTextLocal(filePath: string): Promise<void> {
       line.angle,
     ),
   }));
-
-  console.log('\n=== Reconstructed Lines ===');
-  lineAnnotations.forEach(
-    ({ description, boundingPoly: { vertices: v } }, i) => {
-      const box = `(${v[0].x},${v[0].y}) \u2192 (${v[1].x},${v[1].y}) \u2192 (${v[2].x},${v[2].y}) \u2192 (${v[3].x},${v[3].y})`;
-      console.log(`Line ${i + 1}: "${description}"`);
-      console.log(`         Box: [${box}]`);
-    },
-  );
-
-  console.log('\n=== Parsed Receipt ===');
-  for (const line of receiptLines) {
-    if (line.lineType === 'wrapped') continue;
-    const tag = `[${line.lineType.toUpperCase()}]`.padEnd(12);
-    const name = (line.itemName ?? line.text).padEnd(35);
-    const price = line.price ?? '';
-    console.log(`  ${tag} ${name} ${price}`);
-  }
-
   await saveAnnotatedImage(resolvedPath, lineAnnotations);
+
+  return {
+    lines: receiptLines,
+    angle,
+    items,
+    totalLines,
+    totalItems: items.length,
+    totalUntaxedItems: untaxedItems.length,
+    totalTaxedItems: taxedItems.length,
+    untaxedItemsValue,
+    taxedItemsValue,
+    ocrSubtotal,
+    ocrTax,
+    ocrTotal,
+    calculatedSubtotal,
+    taxRate,
+    confidence,
+  };
 }
 
-/**
- * Detects text in a remote image (Cloud Storage URI or public HTTPS URL).
- */
-async function detectTextRemote(imageUri: string): Promise<void> {
-  console.log(`\nDetecting text in remote image: ${imageUri}\n`);
+// ── Pretty-print helper ──────────────────────────────────────────────────────
 
-  const [result] = await client.textDetection({
-    image: { source: { imageUri } },
-  });
-  const detections = result.textAnnotations;
-
-  if (!detections || detections.length === 0) {
-    console.log('No text detected.');
-    return;
-  }
-
-  console.log('=== Full detected text ===');
-  console.log(detections[0].description);
-
-  // Reconstruct receipt lines using the hybrid algorithm
-  const { lines: receiptLines, angle } = reconstructLines(detections.slice(1));
-
-  console.log(`\nEstimated rotation: ${(angle * 180 / Math.PI).toFixed(2)}°\n`);
-
-  console.log('\n=== Reconstructed Lines ===');
-  receiptLines.forEach((line, i) => {
-    console.log(`Line ${i + 1}: "${line.text}"`);
-  });
-
-  console.log('\n=== Parsed Receipt ===');
-  for (const line of receiptLines) {
+function printReceipt(receipt: Receipt): void {
+  console.log(`\n${colorBold('=== Parsed Receipt ===')}`);
+  for (const line of receipt.lines) {
     if (line.lineType === 'wrapped') continue;
-    const tag = `[${line.lineType.toUpperCase()}]`.padEnd(12);
+    const tag = `[${line.lineType.toUpperCase()}]`.padEnd(14);
     const name = (line.itemName ?? line.text).padEnd(35);
     const price = line.price ?? '';
-    console.log(`  ${tag} ${name} ${price}`);
+    const lineColor =
+      line.lineType === 'subtotal' || line.lineType === 'tax' || line.lineType === 'total'
+        ? colorCyan
+        : line.lineType === 'discount'
+          ? colorWarn
+          : line.lineType === 'untaxed_item'
+            ? colorDim
+            : (s: string) => s;
+    console.log(`  ${lineColor(tag)} ${name} ${price}`);
   }
+
+  console.log(`\n${colorBold('=== Items (with discounts applied) ===')}`);
+  for (const item of receipt.items) {
+    const disc = item.discount !== 0 ? colorWarn(`  disc: ${item.discount.toFixed(2)}`) : '';
+    const taxFlag = item.taxed ? colorDim(' [T]') : '';
+    console.log(`  ${item.name.padEnd(35)} ${item.finalPrice.toFixed(2)}${disc}${taxFlag}`);
+  }
+
+  console.log(`\n${colorBold('=== Summary ===')}`);
+  console.log(`  Total lines:          ${receipt.totalLines}`);
+  console.log(`  Total items:          ${receipt.totalItems}`);
+  console.log(`  Untaxed items:        ${receipt.totalUntaxedItems}   value: $${receipt.untaxedItemsValue.toFixed(2)}`);
+  console.log(`  Taxed items:          ${receipt.totalTaxedItems}    value: $${receipt.taxedItemsValue.toFixed(2)}`);
+  console.log(`  Calculated subtotal:  $${receipt.calculatedSubtotal.toFixed(2)}`);
+  console.log(`  OCR subtotal:         $${receipt.ocrSubtotal?.toFixed(2) ?? colorDim('(not found)')}`);
+  console.log(`  OCR tax:              $${receipt.ocrTax?.toFixed(2) ?? colorDim('(not found)')}`);
+  console.log(`  OCR total:            $${receipt.ocrTotal?.toFixed(2) ?? colorDim('(not found)')}`);
+  console.log(`  Tax rate:             ${receipt.taxRate !== null ? (receipt.taxRate * 100).toFixed(2) + '%' : colorDim('(not computable)')}`);
+
+  // ── Colored confidence report with suggestions ──────────────────────────
+  console.log(formatConfidenceReport(receipt.confidence));
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 (async () => {
-  const mode = process.argv[2] ?? 'remote';
-
-  if (mode === 'local') {
-    // Usage: npx ts-node src/detect.ts local <path-to-image>
-    const filePath = process.argv[3] ?? './sample.jpg';
-    await detectTextLocal(filePath);
-  } else {
-    // Usage: npx ts-node src/detect.ts remote <image-uri>
-    const imageUri =
-      process.argv[3] ?? 'gs://cloud-samples-data/vision/ocr/sign.jpg';
-    await detectTextRemote(imageUri);
-  }
+  const filePath = process.argv[2] ?? './sample.jpg';
+  const receipt = await detectTextLocal(filePath);
+  printReceipt(receipt);
 })().catch((err: Error) => {
   console.error('Error:', err.message ?? err);
   process.exit(1);

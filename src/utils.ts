@@ -132,7 +132,6 @@ export function angleBetween(a: Point, b: Point): number {
 const PRICE_REGEX = /^(?:(?:-?\$?\d{1,3}(?:,\d{3})*\.\d{2})|\(\$?\d{1,3}(?:,\d{3})*\.\d{2}\))(?:-(?!A))?(?:[ -]A)?$/;
 
 export function isPrice(text: string): boolean {
-    console.log(`Checking if "${text}" is a price...`);
   return PRICE_REGEX.test(text.trim());
 }
 
@@ -172,4 +171,139 @@ export function classifyLine(text: string, price: string | null): LineType {
   if (DISCOUNT_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'discount';
   if (TAXED_ITEM_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'taxed_item';
   return 'untaxed_item';
+}
+
+// ── Price value parsing ───────────────────────────────────────────────────────
+
+/**
+ * Extract the numeric value from a price string.
+ * Handles `$`, commas, parentheses (negative), trailing `-`, leading `-`.
+ * Returns 0 if the string cannot be parsed.
+ *
+ * Examples:
+ *   "$12.34"    → 12.34
+ *   "12.34-"    → -12.34  (trailing minus = discount)
+ *   "-$1.50"    → -1.50
+ *   "($3.00)"   → -3.00
+ *   "1.00-A"    → -1.00
+ *   "12.34 A"   → 12.34
+ */
+export function parsePrice(raw: string | null): number {
+  if (!raw) return 0;
+  let s = raw.trim();
+
+  // Detect negativity from surrounding parens or trailing dash (before suffix)
+  const hasParens = s.startsWith('(') && s.includes(')');
+  // trailing minus: "12.34-" or "12.34-A" — the minus is between digits and optional A
+  const hasTrailingMinus = /\d-/.test(s);
+  const hasLeadingMinus = s.startsWith('-');
+
+  // Strip everything except digits, dots, and commas
+  s = s.replace(/[^0-9.,]/g, '');
+  const value = parseFloat(s.replace(/,/g, ''));
+  if (isNaN(value)) return 0;
+
+  return (hasParens || hasTrailingMinus || hasLeadingMinus) ? -Math.abs(value) : value;
+}
+
+// ── Receipt result types ──────────────────────────────────────────────────────
+
+export type Severity = 'info' | 'warn' | 'error';
+
+/**
+ * A single composable check result.
+ * Follows the ChatGPT "small composable rules" pattern:
+ * each check returns a severity, a delta (how far off in $), a message,
+ * and a penalty used for overall scoring.
+ */
+export interface CheckResult {
+  /** Machine-readable check identifier. */
+  id: string;
+  /** Severity: info = FYI, warn = something might be off, error = definite mismatch. */
+  severity: Severity;
+  /** Human-readable explanation of the result. */
+  message: string;
+  /** Dollar amount the check is off by (absolute value), if applicable. */
+  delta?: number;
+  /** Numeric penalty for overall scoring (0 = perfect, higher = worse). */
+  penalty: number;
+}
+
+/** A receipt item with its name, price, and optional discount applied. */
+export interface ReceiptItem {
+  /** Item name from OCR. */
+  name: string;
+  /** Parsed numeric price before discount (always positive). */
+  originalPrice: number;
+  /** Discount amount (negative number, 0 if no discount). */
+  discount: number;
+  /** Final price after discount: originalPrice + discount. */
+  finalPrice: number;
+  /** Whether this item is taxed (price ends with 'A'). */
+  taxed: boolean;
+  /** Raw price string from OCR. */
+  rawPrice: string;
+  /** Raw discount price string from OCR, if a discount was applied. */
+  rawDiscount: string | null;
+}
+
+/**
+ * Confidence report — contains composable check results, legacy booleans,
+ * an overall 0–1 confidence score, and human-readable notes/warnings.
+ */
+export interface ReceiptConfidence {
+  // ── Legacy boolean flags (null = check not applicable) ──
+  /** TOTAL − TAX === OCR SUBTOTAL (if all three exist). */
+  totalMinusTaxEqualsOcrSubtotal: boolean | null;
+  /** Calculated subtotal (sum of items after discounts) === OCR SUBTOTAL. */
+  calculatedSubtotalEqualsOcrSubtotal: boolean | null;
+  /** Calculated subtotal === TOTAL − TAX. */
+  calculatedSubtotalEqualsTotalMinusTax: boolean | null;
+
+  // ── New composable checks ──
+  /** All individual check results (composable rules). */
+  checks: CheckResult[];
+  /** Overall confidence score: 0 = no confidence, 1 = perfect. */
+  overallScore: number;
+
+  /** Informational notes (e.g. inferred values). */
+  notes: string[];
+  /** Actionable warnings when something doesn't add up. */
+  warnings: string[];
+}
+
+/** The fully parsed receipt returned by detectTextLocal. */
+export interface Receipt {
+  /** All reconstructed lines (for reference / annotation). */
+  lines: ReceiptLine[];
+  /** Estimated rotation angle (radians). */
+  angle: number;
+
+  /** Parsed line items with discounts applied. */
+  items: ReceiptItem[];
+
+  // ── Counts ──
+  totalLines: number;
+  totalItems: number;
+  totalUntaxedItems: number;
+  totalTaxedItems: number;
+
+  // ── Values ──
+  /** Sum of all untaxed item final prices (after discounts). */
+  untaxedItemsValue: number;
+  /** Sum of all taxed item final prices (after discounts). */
+  taxedItemsValue: number;
+
+  // ── OCR-extracted summary values (null if not present on receipt) ──
+  ocrSubtotal: number | null;
+  ocrTax: number | null;
+  ocrTotal: number | null;
+
+  /** Calculated subtotal: untaxedItemsValue + taxedItemsValue. */
+  calculatedSubtotal: number;
+  /** Calculated tax rate: ocrTax / taxedItemsValue, or null if not computable. */
+  taxRate: number | null;
+
+  /** Confidence checks. */
+  confidence: ReceiptConfidence;
 }
