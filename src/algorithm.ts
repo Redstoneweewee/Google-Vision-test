@@ -521,6 +521,14 @@ function assignPrice(
   return { price: null, priceIndex: -1 };
 }
 
+function removeNullItemNameItems(lines: ReceiptLine[]): void {
+  for (const line of lines) {
+    if (line.itemName === null) {
+      lines.splice(lines.indexOf(line), 1);
+    }
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    Edge case – Wrapped item names
    ─────────────────────────────────────────────────────────────────────────
@@ -739,6 +747,7 @@ export function reconstructLines(
 
   mergeOrphanPrices(receiptLines, medH);
   handleWrappedNames(receiptLines, medH);
+  removeNullItemNameItems(receiptLines);
 
   return { lines: receiptLines, angle: globalAngle };
 }
