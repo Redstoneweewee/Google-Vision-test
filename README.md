@@ -18,7 +18,7 @@ Uses the [Google Cloud Vision API](https://cloud.google.com/vision/docs/ocr) to 
 ## Prerequisites
 
 - **Node.js** ≥ 18
-- A **service account key** in `service-account-key.json`. Ask me for the key.
+- A **Google Cloud Vision API key**. Ask me for the key.
 
 ---
 
@@ -32,11 +32,11 @@ npm install
 
 ### 2. Configure credentials
 
-Place the service account JSON file in the project root as `service-account-key.json` and set the environment variable:
+Rename `.env.example` to `.env` and fill in the API key:
 
 ```bash
-# .env (change the .env.example file to .env)
-GOOGLE_APPLICATION_CREDENTIALS=./service-account-key.json
+# .env
+GOOGLE_API_KEY=your_api_key_here
 ```
 
 ---
@@ -89,7 +89,6 @@ And saves an annotated image: `receipt_annotated.jpg`.
 ```
 package.json
 README.md
-service-account-key.json    ← your GCP credentials (git-ignored)
 tsconfig.json
 docs/
     algorithm.md            ← detailed algorithm documentation
@@ -146,4 +145,4 @@ Word 1: "WAITING?" — Bounding box: [(50, 30), (230, 30), (230, 70), (50, 70)]
 
 - [Vision API OCR docs](https://cloud.google.com/vision/docs/ocr)
 - [@google-cloud/vision npm package](https://www.npmjs.com/package/@google-cloud/vision)
-- [Authentication setup](https://cloud.google.com/docs/authentication/set-up-adc-local-dev-environment)
+- [Authentication setup](https://cloud.google.com/docs/authentication/api-keys)

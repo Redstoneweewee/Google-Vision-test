@@ -595,6 +595,26 @@ function mergeOrphanPrices(lines: ReceiptLine[], medH: number): void {
     const curTop = Math.min(...cur.words.map((w) => w.top));
     const curBottom = Math.max(...cur.words.map((w) => w.bottom));
 
+    // ── Try the line ABOVE (handles price-before-keyword layout) ────────
+    if (i > 0) {
+      const prev = lines[i - 1];
+      if (
+        prev.price !== null &&
+        prev.lineType !== 'wrapped' &&
+        prev.itemName === null &&
+        prev.words.length > 0
+      ) {
+        const prevBottom = Math.max(...prev.words.map((w) => w.bottom));
+        if (curTop - prevBottom <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
+          cur.price = prev.price;
+          cur.text = prev.text + ' ' + cur.text;
+          cur.words = [...prev.words, ...cur.words];
+          cur.lineType = classifyLine(cur.text, cur.price);
+          prev.lineType = 'wrapped';
+          continue;
+        }
+      }
+    }
     // ── Try the line BELOW first (original logic) ───────────────────────
     if (i < lines.length - 1) {
       const nxt = lines[i + 1];
@@ -616,26 +636,6 @@ function mergeOrphanPrices(lines: ReceiptLine[], medH: number): void {
       }
     }
 
-    // ── Try the line ABOVE (handles price-before-keyword layout) ────────
-    if (i > 0) {
-      const prev = lines[i - 1];
-      if (
-        prev.price !== null &&
-        prev.lineType !== 'wrapped' &&
-        prev.itemName === null &&
-        prev.words.length > 0
-      ) {
-        const prevBottom = Math.max(...prev.words.map((w) => w.bottom));
-        if (curTop - prevBottom <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
-          cur.price = prev.price;
-          cur.text = prev.text + ' ' + cur.text;
-          cur.words = [...prev.words, ...cur.words];
-          cur.lineType = classifyLine(cur.text, cur.price);
-          prev.lineType = 'wrapped';
-          continue;
-        }
-      }
-    }
   }
 }
 

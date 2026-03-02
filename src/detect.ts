@@ -14,9 +14,10 @@ import { checkConfidence, formatConfidenceReport, colorBold, colorDim, colorPass
 type TextAnnotation = protos.google.cloud.vision.v1.IEntityAnnotation;
 type Vertex = protos.google.cloud.vision.v1.IVertex;
 
-// Creates a client
-// Credentials are read automatically from GOOGLE_APPLICATION_CREDENTIALS env var.
-const client = new vision.ImageAnnotatorClient();
+// Creates a client using an API key from the GOOGLE_API_KEY environment variable.
+const client = new vision.ImageAnnotatorClient({
+  apiKey: process.env.GOOGLE_API_KEY,
+});
 
 interface LineAnnotation {
   description: string;
@@ -192,6 +193,7 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
     throw new Error('No text detected in image.');
   }
 
+  console.log(`Full text: ${result.fullTextAnnotation?.text}\n\n`);
   // ── Reconstruct receipt lines ─────────────────────────────────────────
   const { lines: receiptLines, angle } = reconstructLines(detections.slice(1));
 
