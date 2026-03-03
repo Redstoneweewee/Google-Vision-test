@@ -41,6 +41,7 @@ export type LineType =
   | 'tax'
   | 'total'
   | 'subtotal'
+  | 'tender'
   | 'info'
   | 'wrapped';
 
@@ -164,7 +165,32 @@ const TAXED_ITEM_KEYWORDS_PRICE = [
  */
 const PAYMENT_KEYWORDS = [
   'visa', 'mastercard', 'master card', 'amex', 'american express',
-  'discover', 'debit', 'charge', 'change due', 'auth', 'bal due',
+  'discover', 'debit', 'change due', 'bal due',
+];
+
+/**
+ * Tender / payment-detail keywords.  Lines that describe HOW the receipt
+ * was paid — cash tendered, change given, card details, tips, gratuity.
+ * These are never item lines but carry useful cross-check data.
+ *
+ * NOTE: matched with word-boundary regex (\b) to avoid false positives
+ * like "BAND-AID" matching 'aid' or "CHIPS" matching 'chip'.
+ */
+const TENDER_KEYWORDS_RE = [
+  /\bcash\b/, /\btendered\b/, /\bamount tendered\b/, /\bchange\b/,
+  /\btip\b/, /\bgratuity\b/, /\bservice charge\b/,
+  /\bapproved\b/, /\bauth code\b/, /\baid\s*:/, /\bchip\b/,
+  /\bpaid\b/, /\bpayment\b/,
+];
+
+/**
+ * Competing-total keywords — strong total-like markers that can appear
+ * AFTER the primary total line.  When found post-totals, they are treated
+ * as alternative total candidates and scored against the primary total.
+ */
+const COMPETING_TOTAL_KEYWORDS = [
+  'total due', 'amount due', 'total paid', 'balance due',
+  'total with tip', 'grand total',
 ];
 
 /**
@@ -188,9 +214,10 @@ export function classifyLine(text: string, price: string | null): LineType {
   }
   if (TAX_KEYWORDS.some((k) => lower.includes(k))) return 'tax';
   if (DISCOUNT_KEYWORDS.some((k) => lower.includes(k))) return 'discount';
-  if (PAYMENT_KEYWORDS.some((k) => lower.includes(k))) return 'info';
+  if (PAYMENT_KEYWORDS.some((k) => lower.includes(k))) return 'tender';
   // "Sale Price" lines show the post-discount price — informational, not a separate item
   if (lower.includes('sale price')) return 'info';
+  if (TENDER_KEYWORDS_RE.some((re) => re.test(lower))) return 'tender';
   if (!price) return 'info';
   if (DISCOUNT_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'discount';
   if (TAXED_ITEM_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'taxed_item';
@@ -327,6 +354,9 @@ export interface Receipt {
   calculatedSubtotal: number;
   /** Calculated tax rate: ocrTax / taxedItemsValue, or null if not computable. */
   taxRate: number | null;
+
+  /** Largest tender / payment amount detected, or null. */
+  tenderAmount: number | null;
 
   /** Confidence checks. */
   confidence: ReceiptConfidence;

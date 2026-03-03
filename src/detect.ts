@@ -236,6 +236,17 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
 
   const calculatedSubtotal = untaxedItemsValue + taxedItemsValue;
 
+  // ── Tender amount (largest payment line) ──────────────────────────────
+  const tenderAmount: number | null = (() => {
+    let best: number | null = null;
+    for (const l of receiptLines) {
+      if (l.lineType !== 'tender' || l.price === null) continue;
+      const v = parsePrice(l.price);
+      if (v !== null && (best === null || v > best)) best = v;
+    }
+    return best;
+  })();
+
   // ── Confidence ────────────────────────────────────────────────────────
   const confidence = checkConfidence(
     calculatedSubtotal,
@@ -245,6 +256,7 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
     ocrTax,
     ocrTotal,
     taxRate,
+    tenderAmount,
   );
 
   // ── Save annotated image ──────────────────────────────────────────────
@@ -272,6 +284,7 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
     ocrTotal,
     calculatedSubtotal,
     taxRate,
+    tenderAmount,
     confidence,
   };
 }
@@ -292,7 +305,9 @@ function printReceipt(receipt: Receipt): void {
           ? colorWarn
           : line.lineType === 'untaxed_item'
             ? colorDim
-            : (s: string) => s;
+            : line.lineType === 'tender'
+              ? colorDim
+              : (s: string) => s;
     console.log(`  ${lineColor(tag)} ${name} ${price}`);
   }
 
@@ -313,6 +328,7 @@ function printReceipt(receipt: Receipt): void {
   console.log(`  OCR tax:              $${receipt.ocrTax?.toFixed(2) ?? colorDim('(not found)')}`);
   console.log(`  OCR total:            $${receipt.ocrTotal?.toFixed(2) ?? colorDim('(not found)')}`);
   console.log(`  Tax rate:             ${receipt.taxRate !== null ? (receipt.taxRate * 100).toFixed(2) + '%' : colorDim('(not computable)')}`);
+  console.log(`  Tender amount:        $${receipt.tenderAmount?.toFixed(2) ?? colorDim('(not found)')}`);
 
   // ── Colored confidence report with suggestions ──────────────────────────
   console.log(formatConfidenceReport(receipt.confidence));

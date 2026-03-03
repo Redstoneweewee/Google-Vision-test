@@ -564,8 +564,12 @@ function demotePostTotalItems(lines: ReceiptLine[]): void {
     const l = lines[i];
     if (l.lineType === 'wrapped') continue;
     if (['untaxed_item', 'taxed_item'].includes(l.lineType)) {
-      console.debug(`[DEBUG]      Demoting post-keyword item line ${i}: "${l.text}" (${l.price}) → info`);
-      l.lineType = 'info';
+      // Reclassify through classifyLine: if it matches tender keywords
+      // it becomes 'tender'; otherwise demote to 'info'.
+      const reclassified = classifyLine(l.text, l.price);
+      const newType = reclassified === 'tender' ? 'tender' : 'info';
+      console.debug(`[DEBUG]      Demoting post-keyword item line ${i}: "${l.text}" (${l.price}) → ${newType}`);
+      l.lineType = newType;
     }
   }
 }
@@ -627,6 +631,72 @@ function fixKeywordPriceAssignment(lines: ReceiptLine[]): void {
   }
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   Edge case – Competing totals
+   ─────────────────────────────────────────────────────────────────────────
+   Some receipts print multiple total-like lines:
+     "SALE TOTAL  $44.11"  then later  "TOTAL DUE  $44.11"
+   or restaurant receipts:
+     "TOTAL  $20.00"  then  "TOTAL WITH TIP  $24.00"
+
+   When we find multiple 'total' lines with prices, we pick the best one:
+   1. If one satisfies  SUBTOTAL + TAX ≈ TOTAL, prefer it.
+   2. Otherwise, if all have the same price, keep the first.
+   3. Otherwise, prefer the LAST total (usually the final charged amount).
+   Demoted totals become 'info'.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function resolveCompetingTotals(lines: ReceiptLine[]): void {
+  const totalLines = lines.filter(
+    (l) => l.lineType === 'total' && l.price !== null,
+  );
+  if (totalLines.length <= 1) return;
+
+  console.debug(`[DEBUG]    resolveCompetingTotals: ${totalLines.length} total lines found`);
+
+  const sub = lines.find((l) => l.lineType === 'subtotal' && l.price !== null);
+  const tax = lines.find((l) => l.lineType === 'tax' && l.price !== null);
+
+  let winner: ReceiptLine | null = null;
+
+  // Strategy 1: prefer the total that satisfies S + T = TOTAL
+  if (sub && tax) {
+    const subVal = parsePrice(sub.price);
+    const taxVal = parsePrice(tax.price);
+    const expected = subVal + taxVal;
+    for (const t of totalLines) {
+      if (Math.abs(parsePrice(t.price) - expected) < 0.015) {
+        winner = t;
+        console.debug(`[DEBUG]      Winner (S+T match): "${t.text}" = ${t.price}`);
+        break;
+      }
+    }
+  }
+
+  // Strategy 2: if all totals are the same value, keep the first
+  if (!winner) {
+    const vals = totalLines.map((t) => parsePrice(t.price));
+    if (vals.every((v) => Math.abs(v - vals[0]) < 0.015)) {
+      winner = totalLines[0];
+      console.debug(`[DEBUG]      Winner (all same, keep first): "${winner.text}" = ${winner.price}`);
+    }
+  }
+
+  // Strategy 3: prefer the last total (final charged amount)
+  if (!winner) {
+    winner = totalLines[totalLines.length - 1];
+    console.debug(`[DEBUG]      Winner (last total): "${winner.text}" = ${winner.price}`);
+  }
+
+  // Demote all non-winners
+  for (const t of totalLines) {
+    if (t !== winner) {
+      console.debug(`[DEBUG]      Demoting competing total: "${t.text}" (${t.price}) → info`);
+      t.lineType = 'info';
+    }
+  }
+}
+
 function removeNullItemNameItems(lines: ReceiptLine[]): void {
   for (const line of lines) {
     if (line.itemName === null) {
@@ -673,12 +743,12 @@ function handleWrappedNames(lines: ReceiptLine[], medH: number): void {
       gap < WRAP_MAX_VERTICAL_GAP_FACTOR * medH &&
       Math.abs(curLeft - nxtLeft) < WRAP_MAX_LEFT_ALIGN_FACTOR * medH
     ) {
-      // Guard: if merging would reclassify the target line as info
+      // Guard: if merging would reclassify the target line as info or tender
       // (e.g. "TOTAL NUMBER OF…" wrapping into an orphan price), skip.
       const mergedText = [cur.text, nxt.text].filter(Boolean).join(' ');
       const mergedType = classifyLine(mergedText, nxt.price);
-      if (mergedType === 'info') {
-        console.debug(`[DEBUG]      Skipped wrap: "${cur.text}" into "${nxt.text}" — merged text classifies as info`);
+      if (mergedType === 'info' || mergedType === 'tender') {
+        console.debug(`[DEBUG]      Skipped wrap: "${cur.text}" into "${nxt.text}" — merged text classifies as ${mergedType}`);
         continue;
       }
 
@@ -796,12 +866,12 @@ function mergeOrphanItemPrices(lines: ReceiptLine[], medH: number): void {
     if (bestCandidate !== null) {
       const orphan = lines[bestCandidate.idx];
 
-      // Guard: if the merged text would reclassify as 'info' (e.g.
-      // "TOTAL NUMBER OF..." absorbing an orphan price), skip the merge.
+      // Guard: if the merged text would reclassify as 'info' or 'tender'
+      // (e.g. "TOTAL NUMBER OF..." absorbing an orphan price), skip the merge.
       const mergedText = cur.text + ' ' + orphan.text;
       const mergedType = classifyLine(mergedText, orphan.price);
-      if (mergedType === 'info') {
-        console.debug(`[DEBUG]      Skipped merge: "${cur.text}" + "${orphan.price}" — merged text classifies as info`);
+      if (mergedType === 'info' || mergedType === 'tender') {
+        console.debug(`[DEBUG]      Skipped merge: "${cur.text}" + "${orphan.price}" — merged text classifies as ${mergedType}`);
         continue;
       }
 
@@ -1148,6 +1218,7 @@ export function reconstructLines(
   mergeOrphanPrices(receiptLines, medH);
   handleWrappedNames(receiptLines, medH);
   demotePostTotalItems(receiptLines);
+  resolveCompetingTotals(receiptLines);
   fixKeywordPriceAssignment(receiptLines);
   removeNullItemNameItems(receiptLines);
 

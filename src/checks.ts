@@ -67,6 +67,8 @@ export interface CheckContext {
   ocrTax: number | null;
   ocrTotal: number | null;
   taxRate: number | null;
+  /** Tender amount from payment lines (card charge, cash, etc.) if found. */
+  tenderAmount: number | null;
 }
 
 // ── Individual composable checks ─────────────────────────────────────────────
@@ -261,6 +263,26 @@ function checkMissingSummaryLines(ctx: CheckContext): CheckResult[] {
   return results;
 }
 
+/** 9) Tender cross-check — does the payment amount match the total? */
+function checkTenderVsTotal(ctx: CheckContext): CheckResult | null {
+  const { tenderAmount, ocrTotal } = ctx;
+  if (tenderAmount === null || ocrTotal === null) return null;
+  const delta = Math.abs(tenderAmount - ocrTotal);
+  const ok = delta < CENTS_TOLERANCE;
+  // Tender cross-check is informational only — split payments, cash back,
+  // food stamps, and tips all cause legitimate mismatches.  A match is a
+  // nice confirmation; a mismatch is just a note, never a score penalty.
+  return {
+    id: 'tender_vs_total',
+    severity: 'info',
+    message: ok
+      ? `Tender amount ($${tenderAmount.toFixed(2)}) matches TOTAL ($${ocrTotal.toFixed(2)})`
+      : `Tender amount ($${tenderAmount.toFixed(2)}) != TOTAL ($${ocrTotal.toFixed(2)}) — off by $${delta.toFixed(2)} (could indicate tip, split payment, or cash/change mismatch)`,
+    delta,
+    penalty: 0,
+  };
+}
+
 // ── Overall confidence score ─────────────────────────────────────────────────
 
 function computeOverallScore(checks: CheckResult[], ctx: CheckContext): number {
@@ -299,6 +321,7 @@ export function checkConfidence(
   ocrTax: number | null,
   ocrTotal: number | null,
   taxRate: number | null,
+  tenderAmount: number | null = null,
 ): ReceiptConfidence {
   const ctx: CheckContext = {
     calculatedSubtotal,
@@ -308,6 +331,7 @@ export function checkConfidence(
     ocrTax,
     ocrTotal,
     taxRate,
+    tenderAmount,
   };
 
   const allChecks: (CheckResult | null)[] = [
@@ -317,6 +341,7 @@ export function checkConfidence(
     checkCalcSubtotalVsTotalMinusTax(ctx),
     checkTaxConsistency(ctx),
     checkTaxRatePlausibility(ctx),
+    checkTenderVsTotal(ctx),
     checkMissingElement(ctx),
     ...checkMissingSummaryLines(ctx),
   ];
@@ -428,6 +453,13 @@ function getSuggestion(chk: CheckResult): string {
       return 'No tax line was found. The receipt may be tax-exempt, or the tax line was cut off. Tax rate cannot be independently verified.';
     case 'missing_total':
       return 'No total line was found. The receipt may be cut off at the bottom. We cannot verify the final amount.';
+
+    // ── Check 9: Tender cross-check ─────────────────────────────────────
+    case 'tender_vs_total':
+      if (chk.severity === 'info') {
+        return 'The payment amount matches the receipt total — this confirms the final charged amount.';
+      }
+      return `The payment amount differs from the total by $${chk.delta?.toFixed(2) ?? '?'}. This may indicate a tip, split payment, or cash/change math error. Compare the payment section on the receipt.`;
 
     default:
       return chk.message;
