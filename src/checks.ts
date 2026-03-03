@@ -222,19 +222,32 @@ function checkMissingElement(ctx: CheckContext): CheckResult | null {
 function checkMissingSummaryLines(ctx: CheckContext): CheckResult[] {
   const results: CheckResult[] = [];
   if (ctx.ocrSubtotal === null) {
+    // Subtotal is derivable when we have TOTAL and TAX, or cross-checkable
+    // when we at least have TOTAL.  In either case the missing line is
+    // purely informational.
+    const derivable = ctx.ocrTotal !== null && ctx.ocrTax !== null;
+    const crossCheckable = ctx.ocrTotal !== null;
     results.push({
       id: 'missing_subtotal',
-      severity: 'warn',
-      message: 'No SUBTOTAL line found on receipt — cross-checks limited',
-      penalty: 2,
+      severity: derivable || crossCheckable ? 'info' : 'warn',
+      message: derivable
+        ? 'No SUBTOTAL line found on receipt — using TOTAL − TAX as reference'
+        : crossCheckable
+          ? 'No SUBTOTAL line found on receipt — using TOTAL for cross-check'
+          : 'No SUBTOTAL line found on receipt — cross-checks limited',
+      penalty: 0,
     });
   }
   if (ctx.ocrTax === null) {
+    // If there are no taxed items, the tax line is irrelevant.
+    const irrelevant = ctx.taxedItemsValue <= 0;
     results.push({
       id: 'missing_tax',
       severity: 'info',
-      message: 'No TAX line found on receipt — tax rate cannot be verified',
-      penalty: 1,
+      message: irrelevant
+        ? 'No TAX line found on receipt — no taxed items detected so tax is irrelevant'
+        : 'No TAX line found on receipt — tax rate cannot be verified',
+      penalty: irrelevant ? 0 : 1,
     });
   }
   if (ctx.ocrTotal === null) {
@@ -253,9 +266,14 @@ function checkMissingSummaryLines(ctx: CheckContext): CheckResult[] {
 function computeOverallScore(checks: CheckResult[], ctx: CheckContext): number {
   const totalPenalty = checks.reduce((s, c) => s + c.penalty, 0);
 
+  // A summary line is truly missing only when it can't be derived from the
+  // others.  SUBTOTAL is covered when TOTAL is present (cross-checkable).
+  // TAX is irrelevant when there are no taxed items.
+  const subtotalCoverable = ctx.ocrSubtotal === null && ctx.ocrTotal !== null;
+  const taxIrrelevant = ctx.ocrTax === null && ctx.taxedItemsValue <= 0;
   const missingCount =
-    (ctx.ocrSubtotal === null ? 1 : 0) +
-    (ctx.ocrTax === null ? 1 : 0) +
+    (ctx.ocrSubtotal === null && !subtotalCoverable ? 1 : 0) +
+    (ctx.ocrTax === null && !taxIrrelevant ? 1 : 0) +
     (ctx.ocrTotal === null ? 1 : 0);
 
   const fitQuality = Math.exp(-totalPenalty / 50);

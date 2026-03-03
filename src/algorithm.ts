@@ -32,6 +32,7 @@ import {
   angleBetween,
   isPrice,
   classifyLine,
+  parsePrice,
 } from './utils';
 
 import {
@@ -54,6 +55,7 @@ import {
   NEIGHBOR_Y_OVERLAP_MIN,
   NEIGHBOR_MAX_X_GAP_FACTOR,
   NEIGHBOR_MAX_HEIGHT_RATIO,
+  ORPHAN_SEARCH_RADIUS,
 } from './constants';
 
 type TextAnnotation = protos.google.cloud.vision.v1.IEntityAnnotation;
@@ -353,6 +355,8 @@ function ransacSplitCluster(
   if (yRange < RANSAC_SPLIT_THRESHOLD_FACTOR * medH || cluster.length < RANSAC_MIN_CLUSTER_SIZE)
     return [cluster];
 
+  console.debug(`[DEBUG]    RANSAC triggered: yRange=${yRange.toFixed(1)} > threshold=${(RANSAC_SPLIT_THRESHOLD_FACTOR * medH).toFixed(1)}, ${cluster.length} boxes`);
+
   const INLIER_DIST = RANSAC_INLIER_DIST_FACTOR * medH;
   const MAX_ITER = RANSAC_MAX_ITERATIONS;
   const lines: RotatedBox[][] = [];
@@ -521,6 +525,108 @@ function assignPrice(
   return { price: null, priceIndex: -1 };
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   Edge case – Demote items that appear after the keyword block
+   ─────────────────────────────────────────────────────────────────────────
+   On many receipts the section below SUBTOTAL / TAX / TOTAL contains
+   payment-method lines ("VISA CHARGE $44.11"), auth codes, or orphan
+   amounts that the classifier couldn't recognise as payment info.
+   These get classified as untaxed/taxed items and inflate the item sum.
+
+   This function finds the FIRST keyword line (subtotal / tax / total)
+   that has a price, and demotes every item line AFTER it to 'info'.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function demotePostTotalItems(lines: ReceiptLine[]): void {
+  console.debug(`[DEBUG]    demotePostTotalItems: checking for items after keyword block...`);
+
+  // Find the first keyword line (subtotal/tax/total) that has a price.
+  let firstKeywordWithPrice = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (
+      ['subtotal', 'tax', 'total'].includes(lines[i].lineType) &&
+      lines[i].price !== null &&
+      lines[i].lineType !== 'wrapped'
+    ) {
+      firstKeywordWithPrice = i;
+      break;
+    }
+  }
+
+  if (firstKeywordWithPrice === -1) {
+    console.debug(`[DEBUG]      No keyword line with a price found, skipping`);
+    return;
+  }
+
+  console.debug(`[DEBUG]      First keyword with price: line ${firstKeywordWithPrice} ("${lines[firstKeywordWithPrice].text}")`);
+
+  for (let i = firstKeywordWithPrice + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.lineType === 'wrapped') continue;
+    if (['untaxed_item', 'taxed_item'].includes(l.lineType)) {
+      console.debug(`[DEBUG]      Demoting post-keyword item line ${i}: "${l.text}" (${l.price}) → info`);
+      l.lineType = 'info';
+    }
+  }
+}
+
+/**
+ * Correct mis-assigned keyword prices.
+ *
+ * When all three keyword lines (SUBTOTAL, TAX, TOTAL) have prices,
+ * try the constraint SUBTOTAL + TAX = TOTAL to find the unique correct
+ * assignment.  When only SUBTOTAL and TAX are present, tax should never
+ * exceed subtotal so swap them if needed.
+ */
+function fixKeywordPriceAssignment(lines: ReceiptLine[]): void {
+  console.debug(`[DEBUG]    fixKeywordPriceAssignment: checking keyword price consistency...`);
+  const sub = lines.find(l => l.lineType === 'subtotal' && l.price !== null);
+  const tax = lines.find(l => l.lineType === 'tax' && l.price !== null);
+  const tot = lines.find(l => l.lineType === 'total' && l.price !== null);
+
+  // --- Case 1: all three present — constraint-based reassignment ----------
+  if (sub && tax && tot) {
+    const pairs: { str: string; val: number }[] = [
+      { str: sub.price!, val: parsePrice(sub.price) },
+      { str: tax.price!, val: parsePrice(tax.price) },
+      { str: tot.price!, val: parsePrice(tot.price) },
+    ];
+    const sorted = [...pairs].sort((a, b) => a.val - b.val);
+
+    // smallest + middle ≈ largest ?
+    if (
+      sorted[0].val >= 0 &&
+      Math.abs(sorted[0].val + sorted[1].val - sorted[2].val) < 0.02
+    ) {
+      const idealTax = sorted[0].str;
+      const idealSub = sorted[1].str;
+      const idealTot = sorted[2].str;
+
+      if (sub.price !== idealSub || tax.price !== idealTax || tot.price !== idealTot) {
+        console.debug(
+          `[DEBUG]      Reassigning: S=${sorted[1].val}, T=${sorted[0].val}, TOTAL=${sorted[2].val}`,
+        );
+        sub.price = idealSub;
+        tax.price = idealTax;
+        tot.price = idealTot;
+      }
+    }
+    return;
+  }
+
+  // --- Case 2: only SUBTOTAL and TAX — simple swap if subtotal < tax ------
+  if (sub && tax) {
+    const subVal = parsePrice(sub.price);
+    const taxVal = parsePrice(tax.price);
+    if (subVal > 0 && taxVal > 0 && subVal < taxVal) {
+      console.debug(`[DEBUG]      Swapping subtotal (${subVal}) ↔ tax (${taxVal})`);
+      const tmp = sub.price;
+      sub.price = tax.price;
+      tax.price = tmp;
+    }
+  }
+}
+
 function removeNullItemNameItems(lines: ReceiptLine[]): void {
   for (const line of lines) {
     if (line.itemName === null) {
@@ -542,6 +648,7 @@ function removeNullItemNameItems(lines: ReceiptLine[]): void {
    ═══════════════════════════════════════════════════════════════════════════ */
 
 function handleWrappedNames(lines: ReceiptLine[], medH: number): void {
+  console.debug(`[DEBUG]    handleWrappedNames: scanning for info lines that wrap into priced lines...`);
   for (let i = lines.length - 2; i >= 0; i--) {
     const cur = lines[i];
     const nxt = lines[i + 1];
@@ -566,8 +673,146 @@ function handleWrappedNames(lines: ReceiptLine[], medH: number): void {
       gap < WRAP_MAX_VERTICAL_GAP_FACTOR * medH &&
       Math.abs(curLeft - nxtLeft) < WRAP_MAX_LEFT_ALIGN_FACTOR * medH
     ) {
+      // Guard: if merging would reclassify the target line as info
+      // (e.g. "TOTAL NUMBER OF…" wrapping into an orphan price), skip.
+      const mergedText = [cur.text, nxt.text].filter(Boolean).join(' ');
+      const mergedType = classifyLine(mergedText, nxt.price);
+      if (mergedType === 'info') {
+        console.debug(`[DEBUG]      Skipped wrap: "${cur.text}" into "${nxt.text}" — merged text classifies as info`);
+        continue;
+      }
+
+      console.debug(`[DEBUG]      Wrapped: "${cur.text}" → prepended to "${nxt.text}" (gap=${gap.toFixed(1)}, leftDiff=${Math.abs(curLeft - nxtLeft).toFixed(1)})`);
       nxt.itemName = [cur.text, nxt.itemName].filter(Boolean).join(' ');
       cur.lineType = 'wrapped';
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Edge case – Orphan prices for regular items
+   ─────────────────────────────────────────────────────────────────────────
+   When the receipt is tilted or held at an angle, the price at the far
+   right of an item line may drift far enough in x that the neighbor graph
+   can't connect it to the item name.  The result is two separate lines:
+   one with the item name (classified "info", no price) and one with just
+   the price (classified as an item with itemName === null).
+
+   After sorting and keyword-line merging, this function finds priceless
+   info lines (in the item section, above the first keyword line) and
+   searches nearby lines for an orphan price-only line.  It searches UP
+   first (up to ORPHAN_SEARCH_RADIUS lines) for the closest orphan price,
+   then DOWN if nothing was found above.  The search uses angle-projected
+   Y residuals to correctly match on tilted receipts.
+
+   Processes from top to bottom so earlier items claim their prices first.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function mergeOrphanItemPrices(lines: ReceiptLine[], medH: number): void {
+  console.debug(`[DEBUG]    mergeOrphanItemPrices: scanning for orphan item prices...`);
+
+  // Find boundary: first keyword line marks the end of the item section
+  let firstKeywordIdx = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    if (['subtotal', 'tax', 'total'].includes(lines[i].lineType)) {
+      firstKeywordIdx = i;
+      break;
+    }
+  }
+
+  /**
+   * Check if an item name is trivial (null, empty, or just special chars /
+   * a single letter).  Lines like "$ 6.79" or "9.00 F" have itemName "$"
+   * or "F" — these are really just orphan prices, not real items.
+   */
+  function isTrivialItemName(name: string | null): boolean {
+    if (name === null) return true;
+    const cleaned = name.replace(/[^a-zA-Z0-9]/g, '');
+    return cleaned.length <= 1;
+  }
+
+  /** Check if a line is an orphan price (has price, no real item name, not already merged). */
+  function isOrphanPrice(l: ReceiptLine): boolean {
+    return (
+      l.price !== null &&
+      isTrivialItemName(l.itemName) &&
+      l.lineType !== 'wrapped' &&
+      !['subtotal', 'tax', 'total'].includes(l.lineType) &&
+      l.words.length > 0
+    );
+  }
+
+  /** Check if a line is a priceless item (info with no price). */
+  function isPricelessItem(l: ReceiptLine): boolean {
+    return l.lineType === 'info' && l.price === null && l.words.length > 0;
+  }
+
+  /** Compute the angle-projected Y residual between an item line and an orphan price. */
+  function computeResidual(item: ReceiptLine, orphan: ReceiptLine): number {
+    const itemMeanX = item.words.reduce((s, w) => s + w.center.x, 0) / item.words.length;
+    const itemMeanY = item.words.reduce((s, w) => s + w.center.y, 0) / item.words.length;
+    const orphanMeanX = orphan.words.reduce((s, w) => s + w.center.x, 0) / orphan.words.length;
+    const orphanMeanY = orphan.words.reduce((s, w) => s + w.center.y, 0) / orphan.words.length;
+    const expectedY = itemMeanY + (orphanMeanX - itemMeanX) * Math.sin(item.angle);
+    return Math.abs(orphanMeanY - expectedY);
+  }
+
+  // Process priceless items top-to-bottom
+  for (let i = 0; i < firstKeywordIdx; i++) {
+    const cur = lines[i];
+    if (!isPricelessItem(cur)) continue;
+
+    console.debug(`[DEBUG]      Checking item line ${i}: "${cur.text}" for orphan price...`);
+
+    // Search UP first (up to ORPHAN_SEARCH_RADIUS lines)
+    let bestCandidate: { idx: number; residual: number } | null = null;
+    for (let j = i - 1; j >= Math.max(0, i - ORPHAN_SEARCH_RADIUS); j--) {
+      if (j >= firstKeywordIdx) continue;
+      if (!isOrphanPrice(lines[j])) continue;
+      const residual = computeResidual(cur, lines[j]);
+      if (residual <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
+        if (bestCandidate === null || residual < bestCandidate.residual) {
+          bestCandidate = { idx: j, residual };
+        }
+        console.debug(`[DEBUG]        ABOVE candidate line ${j}: "${lines[j].price}" residual=${residual.toFixed(1)}`);
+      }
+    }
+
+    // If nothing found above, search DOWN
+    if (bestCandidate === null) {
+      for (let j = i + 1; j <= Math.min(lines.length - 1, i + ORPHAN_SEARCH_RADIUS); j++) {
+        if (j >= firstKeywordIdx) continue;
+        if (!isOrphanPrice(lines[j])) continue;
+        const residual = computeResidual(cur, lines[j]);
+        if (residual <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
+          // Take the first one found below (closest by line order)
+          bestCandidate = { idx: j, residual };
+          console.debug(`[DEBUG]        BELOW candidate line ${j}: "${lines[j].price}" residual=${residual.toFixed(1)}`);
+          break;
+        }
+      }
+    }
+
+    if (bestCandidate !== null) {
+      const orphan = lines[bestCandidate.idx];
+
+      // Guard: if the merged text would reclassify as 'info' (e.g.
+      // "TOTAL NUMBER OF..." absorbing an orphan price), skip the merge.
+      const mergedText = cur.text + ' ' + orphan.text;
+      const mergedType = classifyLine(mergedText, orphan.price);
+      if (mergedType === 'info') {
+        console.debug(`[DEBUG]      Skipped merge: "${cur.text}" + "${orphan.price}" — merged text classifies as info`);
+        continue;
+      }
+
+      console.debug(`[DEBUG]      Merged: "${cur.text}" + "${orphan.price}" (residual=${bestCandidate.residual.toFixed(1)})`);
+
+      cur.price = orphan.price;
+      cur.itemName = cur.text;
+      cur.text = cur.text + ' ' + orphan.text;
+      cur.words = [...cur.words, ...orphan.words];
+      cur.lineType = classifyLine(cur.text, cur.price);
+      orphan.lineType = 'wrapped';
     }
   }
 }
@@ -578,13 +823,40 @@ function handleWrappedNames(lines: ReceiptLine[], medH: number): void {
    On many receipts the keyword ("SUBTOTAL") and its price ("281.49") are
    far apart horizontally — often beyond the neighbor-graph's x-gap limit.
    They end up as separate tentative lines.  After classification we detect
-   keyword lines with no price, and look for an adjacent price-only line
-   (a line whose entire text is the price with no item name) immediately
-   below.  If found, the price is absorbed into the keyword line and the
-   orphan is hidden.
+   keyword lines with no price, and search nearby lines (within
+   ORPHAN_SEARCH_RADIUS) for a price-only orphan line.
+
+   Processing order: highest unmerged keyword first, then downward.
+   For each keyword, search UP first (up to ORPHAN_SEARCH_RADIUS lines).
+   If nothing is found above, search DOWN for the first orphan price.
+   This handles curved/distorted receipts where all keywords are stacked
+   above their corresponding prices (e.g. SUBTOTAL / TAX / TOTAL followed
+   by 73.60 / 0.44 / 74.04).
    ═══════════════════════════════════════════════════════════════════════════ */
 
 function mergeOrphanPrices(lines: ReceiptLine[], medH: number): void {
+  console.debug(`[DEBUG]    mergeOrphanPrices: scanning ${lines.length} lines for keyword lines without prices...`);
+
+  /**
+   * Check if an item name is trivial — see mergeOrphanItemPrices for docs.
+   */
+  function isTrivialItemName(name: string | null): boolean {
+    if (name === null) return true;
+    const cleaned = name.replace(/[^a-zA-Z0-9]/g, '');
+    return cleaned.length <= 1;
+  }
+
+  /** Check if a line is an orphan price (has price, no real item name, not already used). */
+  function isOrphanPrice(l: ReceiptLine): boolean {
+    return (
+      l.price !== null &&
+      l.lineType !== 'wrapped' &&
+      isTrivialItemName(l.itemName) &&
+      l.words.length > 0
+    );
+  }
+
+  // Process keyword lines top-to-bottom
   for (let i = 0; i < lines.length; i++) {
     const cur = lines[i];
 
@@ -592,50 +864,100 @@ function mergeOrphanPrices(lines: ReceiptLine[], medH: number): void {
     if (!['subtotal', 'tax', 'total'].includes(cur.lineType) || cur.price !== null) continue;
     if (cur.words.length === 0) continue;
 
+    console.debug(`[DEBUG]      Checking keyword line ${i}: "${cur.text}" for orphan price...`);
+
     const curTop = Math.min(...cur.words.map((w) => w.top));
     const curBottom = Math.max(...cur.words.map((w) => w.bottom));
 
-    // ── Try the line ABOVE (handles price-before-keyword layout) ────────
-    if (i > 0) {
-      const prev = lines[i - 1];
-      if (
-        prev.price !== null &&
-        prev.lineType !== 'wrapped' &&
-        prev.itemName === null &&
-        prev.words.length > 0
-      ) {
-        const prevBottom = Math.max(...prev.words.map((w) => w.bottom));
-        if (curTop - prevBottom <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
-          cur.price = prev.price;
-          cur.text = prev.text + ' ' + cur.text;
-          cur.words = [...prev.words, ...cur.words];
-          cur.lineType = classifyLine(cur.text, cur.price);
-          prev.lineType = 'wrapped';
-          continue;
+    // ── Search UP first (up to ORPHAN_SEARCH_RADIUS lines) ──────────────
+    let bestAbove: { idx: number; gap: number } | null = null;
+    for (let j = i - 1; j >= Math.max(0, i - ORPHAN_SEARCH_RADIUS); j--) {
+      const candidate = lines[j];
+      if (!isOrphanPrice(candidate)) continue;
+
+      const candBottom = Math.max(...candidate.words.map((w) => w.bottom));
+      const gap = curTop - candBottom;
+      if (gap <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
+        // Pick the closest above candidate
+        if (bestAbove === null || gap < bestAbove.gap) {
+          bestAbove = { idx: j, gap };
         }
+        console.debug(`[DEBUG]        ABOVE candidate line ${j}: "${candidate.price}" gap=${gap.toFixed(1)}`);
       }
     }
-    // ── Try the line BELOW first (original logic) ───────────────────────
-    if (i < lines.length - 1) {
-      const nxt = lines[i + 1];
-      if (
-        nxt.price !== null &&
-        nxt.lineType !== 'wrapped' &&
-        nxt.itemName === null &&
-        nxt.words.length > 0
-      ) {
-        const nxtTop = Math.min(...nxt.words.map((w) => w.top));
-        if (nxtTop - curBottom <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
-          cur.price = nxt.price;
-          cur.text = cur.text + ' ' + nxt.text;
-          cur.words = [...cur.words, ...nxt.words];
-          cur.lineType = classifyLine(cur.text, cur.price);
-          nxt.lineType = 'wrapped';
-          continue;
+
+    // ── If nothing above, search DOWN (up to ORPHAN_SEARCH_RADIUS) ──────
+    let bestBelow: { idx: number; gap: number } | null = null;
+    if (bestAbove === null) {
+      for (let j = i + 1; j <= Math.min(lines.length - 1, i + ORPHAN_SEARCH_RADIUS); j++) {
+        const candidate = lines[j];
+        if (!isOrphanPrice(candidate)) continue;
+
+        const candTop = Math.min(...candidate.words.map((w) => w.top));
+        const gap = candTop - curBottom;
+        if (gap <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
+          // Take the first valid one below (closest by line order)
+          bestBelow = { idx: j, gap };
+          console.debug(`[DEBUG]        BELOW candidate line ${j}: "${candidate.price}" gap=${gap.toFixed(1)}`);
+          break;
         }
       }
     }
 
+    // ── Merge the best candidate ────────────────────────────────────────
+    if (bestAbove !== null) {
+      const prev = lines[bestAbove.idx];
+      console.debug(`[DEBUG]      Orphan merge: "${cur.text}" ← ABOVE price "${prev.price}" (gap=${bestAbove.gap.toFixed(1)})`);
+      cur.price = prev.price;
+      cur.text = prev.text + ' ' + cur.text;
+      cur.words = [...prev.words, ...cur.words];
+      cur.lineType = classifyLine(cur.text, cur.price);
+      prev.lineType = 'wrapped';
+    } else if (bestBelow !== null) {
+      const nxt = lines[bestBelow.idx];
+      console.debug(`[DEBUG]      Orphan merge: "${cur.text}" ← BELOW price "${nxt.price}" (gap=${bestBelow.gap.toFixed(1)})`);
+      cur.price = nxt.price;
+      cur.text = cur.text + ' ' + nxt.text;
+      cur.words = [...cur.words, ...nxt.words];
+      cur.lineType = classifyLine(cur.text, cur.price);
+      nxt.lineType = 'wrapped';
+    } else {
+      console.debug(`[DEBUG]      No orphan price found for "${cur.text}"`);
+    }
+  }
+
+  // ── Last-resort pass: keyword lines still without prices ──────────────
+  // On heavily-tilted receipts, the price column can drift so far that
+  // orphan prices end up well beyond ORPHAN_SEARCH_RADIUS.  Do a second
+  // pass with no radius/gap limit, matching by nearest Y center.
+  for (let i = 0; i < lines.length; i++) {
+    const cur = lines[i];
+    if (!['subtotal', 'tax', 'total'].includes(cur.lineType) || cur.price !== null) continue;
+    if (cur.words.length === 0) continue;
+
+    const curY = cur.words.reduce((s, w) => s + w.center.y, 0) / cur.words.length;
+    let bestIdx = -1;
+    let bestDist = Infinity;
+
+    for (let j = 0; j < lines.length; j++) {
+      if (!isOrphanPrice(lines[j])) continue;
+      const candY = lines[j].words.reduce((s, w) => s + w.center.y, 0) / lines[j].words.length;
+      const dist = Math.abs(candY - curY);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = j;
+      }
+    }
+
+    if (bestIdx >= 0) {
+      const orphan = lines[bestIdx];
+      console.debug(`[DEBUG]      Last-resort merge: "${cur.text}" ← orphan "${orphan.price}" (Ydist=${bestDist.toFixed(1)})`);
+      cur.price = orphan.price;
+      cur.text = cur.text + ' ' + orphan.text;
+      cur.words = [...cur.words, ...orphan.words];
+      cur.lineType = classifyLine(cur.text, cur.price);
+      orphan.lineType = 'wrapped';
+    }
   }
 }
 
@@ -672,21 +994,40 @@ export function reconstructLines(
       .filter((w) => w > 0),
   );
 
+  console.debug(`[DEBUG] ══════════════════════════════════════════════════`);
+  console.debug(`[DEBUG] reconstructLines: ${boxes.length} word boxes, medH=${medH.toFixed(1)}, charW=${charW.toFixed(1)}`);
+
   // ── Stage 1a: build tentative lines via neighbor graph ────────────────
+  console.debug(`[DEBUG] ── Stage 1a: Building tentative lines via neighbor graph...`);
   const tentativeLines = buildTentativeLines(boxes, medH);
+  console.debug(`[DEBUG]    → ${tentativeLines.length} tentative lines formed`);
+  for (let _i = 0; _i < tentativeLines.length; _i++) {
+    const tl = tentativeLines[_i];
+    console.debug(`[DEBUG]    Line ${_i}: ${tl.length} words → "${tl.map(w => w.text).join(' ')}"`);
+  }
 
   // ── Stage 1b: compute per-line angles ─────────────────────────────────
+  console.debug(`[DEBUG] ── Stage 1b: Computing per-line angles...`);
   const lineAngles = tentativeLines.map((line) => computeLineAngle(line));
+  for (let _i = 0; _i < lineAngles.length; _i++) {
+    const deg = (lineAngles[_i] * 180 / Math.PI).toFixed(2);
+    console.debug(`[DEBUG]    Line ${_i}: angle=${deg}°${lineAngles[_i] === 0 ? ' (singleton → fallback)' : ''}`);
+  }
 
   // ── Stage 1c: global angle fallback for singletons ────────────────────
+  console.debug(`[DEBUG] ── Stage 1c: Global angle fallback...`);
   const validAngles = lineAngles.filter((a) => a !== 0);
   const globalAngle =
     validAngles.length > 0
       ? median(validAngles)
       : estimateGlobalAngle(boxes);
   const resolvedAngles = lineAngles.map((a) => (a === 0 ? globalAngle : a));
+  console.debug(`[DEBUG]    ${validAngles.length} valid per-line angles, globalAngle=${(globalAngle * 180 / Math.PI).toFixed(2)}°`);
+  const singletonCount = lineAngles.filter(a => a === 0).length;
+  if (singletonCount > 0) console.debug(`[DEBUG]    ${singletonCount} singleton lines using global fallback`);
 
   // ── Stage 2: per-line rotation + RANSAC split ─────────────────────────
+  console.debug(`[DEBUG] ── Stage 2: Per-line rotation + RANSAC split...`);
   interface LineBucket {
     boxes: RotatedBox[];
     angle: number;
@@ -697,10 +1038,17 @@ export function reconstructLines(
     const angle = resolvedAngles[i];
     const rotated = rotateBoxes(tentativeLines[i], angle);
     const splits = ransacSplitCluster(rotated, medH);
+    if (splits.length > 1) {
+      console.debug(`[DEBUG]    RANSAC split tentative line ${i} (${tentativeLines[i].length} words) into ${splits.length} sub-lines`);
+      for (let s = 0; s < splits.length; s++) {
+        console.debug(`[DEBUG]      Sub-line ${s}: ${splits[s].length} words → "${splits[s].map(w => w.text).join(' ')}"`);
+      }
+    }
     for (const split of splits) {
       finalBuckets.push({ boxes: split, angle });
     }
   }
+  console.debug(`[DEBUG]    → ${finalBuckets.length} final line buckets (from ${tentativeLines.length} tentative)`);
 
   // ── Stage 3: order words left → right ─────────────────────────────────
   const orderedBuckets = finalBuckets.map(({ boxes: bxs, angle }) => ({
@@ -708,13 +1056,58 @@ export function reconstructLines(
     angle,
   }));
 
-  // ── Stage 4: price column detection & assignment ──────────────────────
+  // ── Stage 3b: detect price column & split multi-price lines ───────────
+  console.debug(`[DEBUG] ── Stage 3b: Detect price column & split multi-price lines...`);
   const priceColX = detectPriceColumnX(
     orderedBuckets.map((b) => b.ordered),
   );
+  console.debug(`[DEBUG]    Price column X: ${priceColX !== null ? priceColX.toFixed(1) : '(not detected)'}`);
+
+  // If a single line has multiple price tokens near the price column,
+  // it probably merged multiple receipt lines (common with background text
+  // overlapping receipts).  Split at each price token boundary.
+  if (priceColX !== null) {
+    for (let bi = orderedBuckets.length - 1; bi >= 0; bi--) {
+      const { ordered, angle } = orderedBuckets[bi];
+      // Find all price token indices near the price column
+      const priceIndices: number[] = [];
+      for (let wi = 0; wi < ordered.length; wi++) {
+        if (
+          isPrice(ordered[wi].text) &&
+          Math.abs(ordered[wi].right - priceColX) <= PRICE_COLUMN_TOLERANCE_FACTOR * medH
+        ) {
+          priceIndices.push(wi);
+        }
+      }
+      if (priceIndices.length < 2) continue;
+
+      // Split: each price ends a sub-line, leftovers go into the last group
+      console.debug(`[DEBUG]    Multi-price split: line "${ordered.map(w => w.text).join(' ')}" has ${priceIndices.length} prices at indices [${priceIndices.join(',')}]`);
+      const subLines: { ordered: RotatedBox[]; angle: number }[] = [];
+      let start = 0;
+      for (const pi of priceIndices) {
+        subLines.push({ ordered: ordered.slice(start, pi + 1), angle });
+        start = pi + 1;
+      }
+      // Any trailing words after the last price go into the last sub-line
+      if (start < ordered.length) {
+        subLines[subLines.length - 1].ordered = [
+          ...subLines[subLines.length - 1].ordered,
+          ...ordered.slice(start),
+        ];
+      }
+      orderedBuckets.splice(bi, 1, ...subLines);
+      for (let s = 0; s < subLines.length; s++) {
+        console.debug(`[DEBUG]      Sub-line ${s}: ${subLines[s].ordered.length} words → "${subLines[s].ordered.map(w => w.text).join(' ')}"`);
+      }
+    }
+  }
+
+  // ── Stage 4: price assignment ─────────────────────────────────────────
+  console.debug(`[DEBUG] ── Stage 4: Price column detection & assignment...`);
 
   const receiptLines: ReceiptLine[] = orderedBuckets.map(
-    ({ ordered, angle }) => {
+    ({ ordered, angle }, _idx) => {
       const text = buildLineText(ordered, charW);
       const { price, priceIndex } = assignPrice(ordered, priceColX, medH);
 
@@ -724,6 +1117,10 @@ export function reconstructLines(
           : text.trim();
 
       const lineType = classifyLine(text, price);
+
+      console.debug(
+        `[DEBUG]    Line ${_idx}: type=${lineType.padEnd(12)} price=${(price ?? '(none)').toString().padEnd(10)} text="${text}"`
+      );
 
       return {
         words: ordered,
@@ -737,6 +1134,7 @@ export function reconstructLines(
   );
 
   // ── Stage 5: sort top → bottom by original y, then edge cases ─────────
+  console.debug(`[DEBUG] ── Stage 5: Sort + edge cases...`);
   receiptLines.sort((a, b) => {
     const aY =
       a.words.reduce((s, w) => s + w.center.y, 0) / (a.words.length || 1);
@@ -745,9 +1143,20 @@ export function reconstructLines(
     return aY - bY;
   });
 
+  // Item prices first so keyword lines don't steal item orphan prices
+  mergeOrphanItemPrices(receiptLines, medH);
   mergeOrphanPrices(receiptLines, medH);
   handleWrappedNames(receiptLines, medH);
+  demotePostTotalItems(receiptLines);
+  fixKeywordPriceAssignment(receiptLines);
   removeNullItemNameItems(receiptLines);
+
+  console.debug(`[DEBUG] ── Final output: ${receiptLines.length} lines (excluding wrapped)`);
+  for (const rl of receiptLines) {
+    if (rl.lineType === 'wrapped') continue;
+    console.debug(`[DEBUG]    [${rl.lineType.padEnd(12)}] ${(rl.itemName ?? rl.text).padEnd(35)} ${rl.price ?? ''}`);
+  }
+  console.debug(`[DEBUG] ══════════════════════════════════════════════════`);
 
   return { lines: receiptLines, angle: globalAngle };
 }

@@ -157,6 +157,17 @@ const TAXED_ITEM_KEYWORDS_PRICE = [
 ];
 
 /**
+ * Payment-method keywords.  Lines containing these are credit/debit card
+ * charges, cash-back, or auth-code receipts — never actual item lines.
+ * Checked AFTER subtotal/total/tax/discount so those still take priority
+ * (e.g. "VISA TOTAL $17.49" is classified as 'total', not payment).
+ */
+const PAYMENT_KEYWORDS = [
+  'visa', 'mastercard', 'master card', 'amex', 'american express',
+  'discover', 'debit', 'charge', 'change due', 'auth', 'bal due',
+];
+
+/**
  * Classify a receipt line by its text content.
  * Check order matters: "subtotal" must be checked before "total".
  */
@@ -164,9 +175,22 @@ export function classifyLine(text: string, price: string | null): LineType {
   const lower = text.toLowerCase();
 
   if (SUBTOTAL_KEYWORDS.some((k) => lower.includes(k))) return 'subtotal';
-  if (TOTAL_KEYWORDS.some((k) => lower.includes(k))) return 'total';
+  if (TOTAL_KEYWORDS.some((k) => lower.includes(k))) {
+    // "TOTAL NUMBER OF ITEMS SOLD" etc. are informational, not the receipt total
+    if (lower.includes('number of')) return 'info';
+    // EBT / food-stamp / loyalty balance lines are payment info, not the receipt total
+    if (lower.includes('food stamps') || lower.includes('food stamp')) return 'info';
+    if (lower.includes('ebt')) return 'info';
+    if (lower.includes('cash balance')) return 'info';
+    // "TOTAL DISCOUNTS" is a savings summary, not the receipt total
+    if (lower.includes('discounts')) return 'info';
+    return 'total';
+  }
   if (TAX_KEYWORDS.some((k) => lower.includes(k))) return 'tax';
   if (DISCOUNT_KEYWORDS.some((k) => lower.includes(k))) return 'discount';
+  if (PAYMENT_KEYWORDS.some((k) => lower.includes(k))) return 'info';
+  // "Sale Price" lines show the post-discount price — informational, not a separate item
+  if (lower.includes('sale price')) return 'info';
   if (!price) return 'info';
   if (DISCOUNT_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'discount';
   if (TAXED_ITEM_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'taxed_item';

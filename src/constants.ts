@@ -193,7 +193,7 @@ export const PRICE_COLUMN_TOLERANCE_FACTOR = 3;
  * slightly larger-than-normal gaps while excluding lines that are a full
  * blank line apart.
  */
-export const WRAP_MAX_VERTICAL_GAP_FACTOR = 1.5;
+export const WRAP_MAX_VERTICAL_GAP_FACTOR = 1.8;
 
 /**
  * **Used in:** `handleWrappedNames` – left-alignment check.
@@ -243,4 +243,26 @@ export const NEIGHBOR_MAX_X_GAP_FACTOR = 8;
  * or logos.  Tighten to 1.5 if you're getting false connections to headers.
  */
 export const NEIGHBOR_MAX_HEIGHT_RATIO = 2.0;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Edge case – Orphan price search radius
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * **Used in:** `mergeOrphanPrices`, `mergeOrphanItemPrices` – how many
+ * lines above/below to scan when looking for an orphan price.
+ *
+ * On distorted or curved receipts, the keyword lines (SUBTOTAL, TAX,
+ * TOTAL) and their prices may each be separate lines, with all keywords
+ * stacked above their corresponding prices.  In the worst observed case
+ * there are 3 keywords followed by 3 prices, plus occasional noise lines
+ * ("-", "=", etc.) interleaved.  A radius of 4 covers:
+ *   - 3 consecutive keyword lines (SUBTOTAL → skip TAX, TOTAL → reach 73.60)
+ *   - 1 extra for noise lines that sometimes appear between keywords and prices
+ *
+ * Increasing beyond 4 risks matching unrelated prices from the receipt
+ * body or footer.  The vertical-gap check (WRAP_MAX_VERTICAL_GAP_FACTOR)
+ * provides an additional safety net.
+ */
+export const ORPHAN_SEARCH_RADIUS = 4;
 
