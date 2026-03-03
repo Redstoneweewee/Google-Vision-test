@@ -5,6 +5,7 @@
   "main": "dist/detect.js",
   "scripts": {
     "start": "npx ts-node src/detect.ts",
+    "test": "npx ts-node src/run-tests.ts",
     "detect:local": "npx ts-node src/detect.ts local",
     "detect:remote": "npx ts-node src/detect.ts remote",
     "build": "npx tsc",
