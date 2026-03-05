@@ -31,6 +31,7 @@ import {
   rotatePoint,
   angleBetween,
   isPrice,
+  tryStripTaxFlag,
   classifyLine,
   parsePrice,
 } from './utils';
@@ -475,7 +476,7 @@ function detectPriceColumnX(allLines: RotatedBox[][]): number | null {
   const priceRights: number[] = [];
   for (const line of allLines) {
     for (const box of line) {
-      if (isPrice(box.text)) priceRights.push(box.right);
+      if (isPrice(box.text) || tryStripTaxFlag(box.text)) priceRights.push(box.right);
     }
   }
   return priceRights.length >= PRICE_COLUMN_MIN_PRICES ? median(priceRights) : null;
@@ -488,7 +489,10 @@ function assignPrice(
 ): { price: string | null; priceIndex: number } {
   // Walk right → left; pick the first (rightmost) price token
   for (let i = ordered.length - 1; i >= 0; i--) {
-    if (!isPrice(ordered[i].text)) continue;
+    const rawText = ordered[i].text;
+    // Check if the token is a price directly, or a fused tax-flag+price (e.g. "F2.00")
+    const stripped = tryStripTaxFlag(rawText);
+    if (!isPrice(rawText) && !stripped) continue;
 
     // If a price column was detected, verify this token is near it.
     // Use original (unrotated) right edges so that per-line angle
@@ -498,9 +502,11 @@ function assignPrice(
       if (Math.abs(ordered[i].right - priceColX) > PRICE_COLUMN_TOLERANCE_FACTOR * medH) continue;
     }
 
+    // Use the stripped (flag-free) price if that's how it matched
+    let price = stripped ?? rawText.trim();
+
     // Absorb trailing suffix tokens that OCR may have split from the price.
     // Known suffixes: "-" (discount), "A" (taxed item), "-A" (taxed item).
-    let price = ordered[i].text.trim();
     for (let j = i + 1; j < ordered.length && j <= i + 2; j++) {
       const suf = ordered[j].text.trim();
       if (!/^(-|A|-A)$/i.test(suf)) break;
@@ -526,6 +532,120 @@ function assignPrice(
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   Voided entry handling
+   ─────────────────────────────────────────────────────────────────────────
+   Some receipts (esp. Walmart) have a `** VOIDED ENTRY` marker that
+   means the previous item was scanned by mistake and should be removed.
+   This function finds such markers and demotes the preceding item to
+   'info' so it isn't counted.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function handleVoidedEntries(lines: ReceiptLine[]): void {
+  console.debug(`[DEBUG]    handleVoidedEntries: scanning for void markers...`);
+  for (let i = 0; i < lines.length; i++) {
+    const lower = lines[i].text.toLowerCase();
+    if (!/\bvoid(ed)?\b/.test(lower)) continue;
+
+    console.debug(`[DEBUG]      Found void marker at line ${i}: "${lines[i].text}"`);
+    // Demote the closest preceding item line
+    for (let j = i - 1; j >= 0; j--) {
+      if (['untaxed_item', 'taxed_item'].includes(lines[j].lineType)) {
+        console.debug(`[DEBUG]        Voiding item at line ${j}: "${lines[j].text}" (${lines[j].price})`);
+        lines[j].lineType = 'info';
+        break;
+      }
+    }
+    // The void marker itself becomes info
+    if (lines[i].lineType !== 'info') {
+      lines[i].lineType = 'info';
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Assign adjacent prices to priceless keyword / tender lines
+   ─────────────────────────────────────────────────────────────────────────
+   Some receipt formats (e.g. Trader Joe's) have keyword lines (SUBTOTAL,
+   TOTAL) where the dollar amount appears as a separate OCR text block
+   on an adjacent info line (e.g. "$38.68" on its own line).  This
+   function detects that pattern and assigns the adjacent price.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function assignAdjacentPricesToKeywords(lines: ReceiptLine[]): void {
+  console.debug(`[DEBUG]    assignAdjacentPricesToKeywords: scanning for priceless keyword lines...`);
+
+  const isPriceOnlyLine = (l: ReceiptLine): boolean => {
+    if (l.lineType !== 'info') return false;
+    const t = l.text.trim().replace(/^\$/, '');
+    return t.length > 0 && isPrice(t);
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (!['subtotal', 'total', 'tax', 'tender'].includes(l.lineType)) continue;
+    if (l.price !== null) continue; // already has a price
+
+    // Check line BEFORE first (more reliable for interleaved layouts)
+    if (i - 1 >= 0 && isPriceOnlyLine(lines[i - 1])) {
+      l.price = lines[i - 1].text.trim().replace(/^\$/, '');
+      lines[i - 1].lineType = 'wrapped'; // consumed
+      console.debug(`[DEBUG]      Assigned adjacent price "${l.price}" to ${l.lineType} line ${i} ("${l.text}") from line before`);
+      continue;
+    }
+
+    // Fallback: check line AFTER
+    if (i + 1 < lines.length && isPriceOnlyLine(lines[i + 1])) {
+      l.price = lines[i + 1].text.trim().replace(/^\$/, '');
+      lines[i + 1].lineType = 'wrapped'; // consumed
+      console.debug(`[DEBUG]      Assigned adjacent price "${l.price}" to ${l.lineType} line ${i} ("${l.text}") from line after`);
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Split combined TAX / BAL lines
+   ─────────────────────────────────────────────────────────────────────────
+   Some receipts (e.g. Whole Foods) combine tax and balance on one line:
+       **** TAX .93 BAL 45.44
+   This function detects the pattern and:
+     1. Sets the tax line's price to the TAX amount
+     2. Inserts a synthetic TOTAL line with the BAL amount
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function splitTaxBalLine(lines: ReceiptLine[]): void {
+  console.debug(`[DEBUG]    splitTaxBalLine: scanning for combined TAX/BAL lines...`);
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.lineType !== 'tax' || l.price !== null) continue;
+
+    // Try patterns like "TAX .93 BAL 45.44" or "TAX 1.23 BAL 56.78"
+    const m = l.text.match(/\btax\s+(\d*\.?\d+)\s+bal(?:ance)?\s+(\d+\.\d{2})\b/i);
+    if (!m) continue;
+
+    const taxVal = m[1];   // e.g. ".93" or "1.23"
+    const balVal = m[2];   // e.g. "45.44"
+
+    console.debug(`[DEBUG]      Line ${i}: splitting TAX=${taxVal}, BAL=${balVal} from "${l.text}"`);
+
+    // Assign the tax amount to this line
+    l.price = taxVal;
+
+    // Insert a synthetic total line right after
+    const syntheticTotal: ReceiptLine = {
+      text: `BAL ${balVal}`,
+      words: [],
+      itemName: `BAL ${balVal}`,
+      price: balVal,
+      lineType: 'total',
+      angle: l.angle,
+    };
+    lines.splice(i + 1, 0, syntheticTotal);
+    // Skip the just-inserted line
+    i++;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    Edge case – Demote items that appear after the keyword block
    ─────────────────────────────────────────────────────────────────────────
    On many receipts the section below SUBTOTAL / TAX / TOTAL contains
@@ -533,34 +653,36 @@ function assignPrice(
    amounts that the classifier couldn't recognise as payment info.
    These get classified as untaxed/taxed items and inflate the item sum.
 
-   This function finds the FIRST keyword line (subtotal / tax / total)
+   This function finds the LAST keyword line (subtotal / total)
    that has a price, and demotes every item line AFTER it to 'info'.
    ═══════════════════════════════════════════════════════════════════════════ */
 
 function demotePostTotalItems(lines: ReceiptLine[]): void {
   console.debug(`[DEBUG]    demotePostTotalItems: checking for items after keyword block...`);
 
-  // Find the first keyword line (subtotal/tax/total) that has a price.
-  let firstKeywordWithPrice = -1;
-  for (let i = 0; i < lines.length; i++) {
+  // Find the LAST total or subtotal line with a price.
+  // Using the last (rather than first) avoids demoting real items
+  // that appear between intermediate subtotals on multi-section receipts.
+  let boundaryIdx = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
     if (
-      ['subtotal', 'tax', 'total'].includes(lines[i].lineType) &&
+      ['total', 'subtotal'].includes(lines[i].lineType) &&
       lines[i].price !== null &&
       lines[i].lineType !== 'wrapped'
     ) {
-      firstKeywordWithPrice = i;
+      boundaryIdx = i;
       break;
     }
   }
 
-  if (firstKeywordWithPrice === -1) {
-    console.debug(`[DEBUG]      No keyword line with a price found, skipping`);
+  if (boundaryIdx === -1) {
+    console.debug(`[DEBUG]      No total/subtotal line with a price found, skipping`);
     return;
   }
 
-  console.debug(`[DEBUG]      First keyword with price: line ${firstKeywordWithPrice} ("${lines[firstKeywordWithPrice].text}")`);
+  console.debug(`[DEBUG]      Boundary line: ${boundaryIdx} ("${lines[boundaryIdx].text}")`);
 
-  for (let i = firstKeywordWithPrice + 1; i < lines.length; i++) {
+  for (let i = boundaryIdx + 1; i < lines.length; i++) {
     const l = lines[i];
     if (l.lineType === 'wrapped') continue;
     if (['untaxed_item', 'taxed_item'].includes(l.lineType)) {
@@ -1143,7 +1265,7 @@ export function reconstructLines(
       const priceIndices: number[] = [];
       for (let wi = 0; wi < ordered.length; wi++) {
         if (
-          isPrice(ordered[wi].text) &&
+          (isPrice(ordered[wi].text) || tryStripTaxFlag(ordered[wi].text)) &&
           Math.abs(ordered[wi].right - priceColX) <= PRICE_COLUMN_TOLERANCE_FACTOR * medH
         ) {
           priceIndices.push(wi);
@@ -1215,9 +1337,15 @@ export function reconstructLines(
 
   // Item prices first so keyword lines don't steal item orphan prices
   mergeOrphanItemPrices(receiptLines, medH);
-  mergeOrphanPrices(receiptLines, medH);
   handleWrappedNames(receiptLines, medH);
+  // Split combined TAX/BAL lines (e.g. "**** TAX .93 BAL 45.44")
+  splitTaxBalLine(receiptLines);
+  // Assign prices from adjacent info lines to priceless keyword lines
+  // BEFORE mergeOrphanPrices, so keywords don't get wrong orphan prices
+  assignAdjacentPricesToKeywords(receiptLines);
+  mergeOrphanPrices(receiptLines, medH);
   demotePostTotalItems(receiptLines);
+  handleVoidedEntries(receiptLines);
   resolveCompetingTotals(receiptLines);
   fixKeywordPriceAssignment(receiptLines);
   removeNullItemNameItems(receiptLines);

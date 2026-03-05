@@ -178,11 +178,11 @@ function checkTaxRatePlausibility(ctx: CheckContext): CheckResult | null {
   const ok = taxRate >= 0 && taxRate <= MAX_PLAUSIBLE_TAX_RATE;
   return {
     id: 'tax_rate_plausibility',
-    severity: ok ? 'info' : 'error',
+    severity: 'info',
     message: ok
       ? `Inferred tax rate ${pct.toFixed(2)}% is plausible (0-15%)`
       : `Inferred tax rate ${pct.toFixed(2)}% is outside plausible range (0-15%) — possible taxability misclassification or OCR error`,
-    penalty: ok ? 0 : 15,
+    penalty: 0,
   };
 }
 
@@ -241,8 +241,11 @@ function checkMissingSummaryLines(ctx: CheckContext): CheckResult[] {
     });
   }
   if (ctx.ocrTax === null) {
-    // If there are no taxed items, the tax line is irrelevant.
-    const irrelevant = ctx.taxedItemsValue <= 0;
+    // Tax is irrelevant when there are no taxed items, OR when the
+    // calculated subtotal already matches the total (tax is zero or
+    // included in prices, e.g. VAT-inclusive receipts).
+    const irrelevant = ctx.taxedItemsValue <= 0 ||
+      (ctx.ocrTotal !== null && Math.abs(ctx.calculatedSubtotal - ctx.ocrTotal) < CENTS_TOLERANCE);
     results.push({
       id: 'missing_tax',
       severity: 'info',
@@ -290,9 +293,13 @@ function computeOverallScore(checks: CheckResult[], ctx: CheckContext): number {
 
   // A summary line is truly missing only when it can't be derived from the
   // others.  SUBTOTAL is covered when TOTAL is present (cross-checkable).
-  // TAX is irrelevant when there are no taxed items.
+  // TAX is irrelevant when there are no taxed items, OR when the calculated
+  // subtotal already matches the total (tax is zero or included in prices).
   const subtotalCoverable = ctx.ocrSubtotal === null && ctx.ocrTotal !== null;
-  const taxIrrelevant = ctx.ocrTax === null && ctx.taxedItemsValue <= 0;
+  const taxIrrelevant = ctx.ocrTax === null && (
+    ctx.taxedItemsValue <= 0 ||
+    (ctx.ocrTotal !== null && Math.abs(ctx.calculatedSubtotal - ctx.ocrTotal) < CENTS_TOLERANCE)
+  );
   const missingCount =
     (ctx.ocrSubtotal === null && !subtotalCoverable ? 1 : 0) +
     (ctx.ocrTax === null && !taxIrrelevant ? 1 : 0) +

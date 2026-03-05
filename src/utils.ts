@@ -136,11 +136,21 @@ export function isPrice(text: string): boolean {
   return PRICE_REGEX.test(text.trim());
 }
 
+/**
+ * Try to strip a leading Walmart-style tax flag letter (F, N, T, X, B, O, R)
+ * that OCR sometimes fuses with the price token.  E.g. "F2.00" → "2.00".
+ * Returns the bare price string or null if no flag pattern is found.
+ */
+export function tryStripTaxFlag(text: string): string | null {
+  const m = text.trim().match(/^[FNTXBOR](\$?\d{1,3}(?:,\d{3})*\.\d{2})$/i);
+  return m && isPrice(m[1]) ? m[1] : null;
+}
+
 // ── Line classification by keywords ───────────────────────────────────────────
 
-const SUBTOTAL_KEYWORDS = ['subtotal', 'sub-total', 'sub total'];
+const SUBTOTAL_KEYWORDS = ['subtotal', 'sub-total', 'sub total', 'net sales'];
 const TOTAL_KEYWORDS = ['total', 'amount due', 'balance', 'grand total'];
-const TAX_KEYWORDS = ['tax', 'hst', 'gst', 'pst', 'vat'];
+const TAX_KEYWORDS_RE = [/\btax\d*\b/, /\bhst\b/, /\bgst\b/, /\bpst\b/, /\bvat\b/];
 const DISCOUNT_KEYWORDS = [
   'disc',
   'discount',
@@ -180,7 +190,8 @@ const TENDER_KEYWORDS_RE = [
   /\bcash\b/, /\btendered\b/, /\bamount tendered\b/, /\bchange\b/,
   /\btip\b/, /\bgratuity\b/, /\bservice charge\b/,
   /\bapproved\b/, /\bauth code\b/, /\baid\s*:/, /\bchip\b/,
-  /\bpaid\b/, /\bpayment\b/,
+  /\bpaid\b/, /\bpayment\b/, /\bactivation\b/, /\bredemption\b/,
+  /\btend\b/,
 ];
 
 /**
@@ -210,9 +221,20 @@ export function classifyLine(text: string, price: string | null): LineType {
     if (lower.includes('cash balance')) return 'info';
     // "TOTAL DISCOUNTS" is a savings summary, not the receipt total
     if (lower.includes('discounts')) return 'info';
+    // "TOTAL TAX" / "TOTAL SAVINGS" are summary labels, not the receipt total
+    if (/\btotal\s+tax\b/.test(lower)) return 'info';
+    if (/\btotal\s+savings?\b/.test(lower)) return 'info';
     return 'total';
   }
-  if (TAX_KEYWORDS.some((k) => lower.includes(k))) return 'tax';
+  // "VAT No" / "VAT Number" / "VAT Reg" = registration info, not a tax amount
+  if (/\bvat\s*(no|number|reg)\b/.test(lower)) return 'info';
+  // "VAT rate" is a label/header, not a tax amount line
+  if (/\bvat\s+rate\b/.test(lower)) return 'info';
+  // "TAX INVOICE" = document label, not a tax amount
+  if (/\btax\s*invoice\b/.test(lower)) return 'info';
+  if (TAX_KEYWORDS_RE.some((re) => re.test(lower))) return 'tax';
+  // "Save money" (Walmart slogan) is informational, not a discount offer
+  if (/\bsave\s+money\b/.test(lower)) return 'info';
   if (DISCOUNT_KEYWORDS.some((k) => lower.includes(k))) return 'discount';
   if (PAYMENT_KEYWORDS.some((k) => lower.includes(k))) return 'tender';
   // "Sale Price" lines show the post-discount price — informational, not a separate item

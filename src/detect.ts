@@ -152,7 +152,7 @@ function buildItems(lines: ReceiptLine[]): ReceiptItem[] {
         rawDiscount: null,
       });
     } else if (line.lineType === 'discount') {
-      const discountValue = parsePrice(line.price); // negative
+      const discountValue = -Math.abs(parsePrice(line.price)); // always negative
       if (items.length > 0) {
         const target = items[items.length - 1];
         target.discount += discountValue;
@@ -218,8 +218,35 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
     return line ? parsePrice(line.price) : null;
   };
 
-  const ocrSubtotal = findOcrValue('subtotal');
-  const ocrTax = findOcrValue('tax');
+  // Use the LAST subtotal (some receipts have intermediate subtotals)
+  const ocrSubtotal = (() => {
+    const subs = receiptLines.filter((l) => l.lineType === 'subtotal' && l.price !== null);
+    return subs.length > 0 ? parsePrice(subs[subs.length - 1].price) : null;
+  })();
+
+  // Sum tax lines, but detect breakdown vs total pattern.
+  // Costco: "TAX 3.52" (total) + "A 8.50% TAX 0.55" + "E 3.75% TAX 2.97" (breakdowns sum to 3.52)
+  // Walmart: "TAX 1 1.15" + "TAX 4 0.30" (independent categories → sum)
+  const ocrTax = (() => {
+    const taxLines = receiptLines.filter((l) => l.lineType === 'tax' && l.price !== null);
+    if (taxLines.length === 0) return null;
+    if (taxLines.length === 1) return parsePrice(taxLines[0].price);
+
+    const values = taxLines.map((l) => parsePrice(l.price));
+    const maxVal = Math.max(...values);
+    const maxIdx = values.indexOf(maxVal);
+    const othersSum = values.reduce((s, v, i) => (i === maxIdx ? s : s + v), 0);
+
+    // If the smaller lines sum ≈ the largest, the largest is a total line
+    // and the others are breakdowns → use just the largest.
+    if (Math.abs(othersSum - maxVal) < 0.02) {
+      return maxVal;
+    }
+
+    // Otherwise they are independent tax categories → sum all.
+    return values.reduce((s, v) => s + v, 0);
+  })();
+
   const ocrTotal = findOcrValue('total');
 
   // ── Tax rate ──────────────────────────────────────────────────────────
