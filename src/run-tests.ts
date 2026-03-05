@@ -235,11 +235,15 @@ interface TestResult {
   // ── Write full output file ─────────────────────────────────────────────
 
   // Find next available test_results_N.txt
-  let iteration = 0;
+
+  const iterationStr = fs.readFileSync(path.join(projectRoot, `iteration.txt`), 'utf-8'); // ensure __dirname is correct even if run with ts-node from another folder
+  let iteration = parseInt(iterationStr, 10) || 0;
   while (fs.existsSync(path.join(projectRoot, `test_results_${iteration}.txt`))) {
     iteration++;
   }
   const outPath = path.join(projectRoot, `test_results_${iteration}.txt`);
+  iteration++; // increment for next run
+  fs.writeFileSync(path.join(projectRoot, `iteration.txt`), String(iteration), 'utf-8'); // save iteration for next run
   const lines: string[] = [];
 
   lines.push('='.repeat(80));
