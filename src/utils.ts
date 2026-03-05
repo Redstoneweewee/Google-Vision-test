@@ -128,9 +128,12 @@ export function angleBetween(a: Point, b: Point): number {
 
 /**
  * Matches common receipt price formats:
- * `12.34`  `-12.34`  `12.34-`  `$1,234.56`  `-$1,234.56`  `(1,234.56)`  `($1,234.56)`  `(1,234.56)-`  `12.34 A`  `12.34-A`
+ * `12.34`  `-12.34`  `12.34-`  `$1,234.56`  `-$1,234.56`  `(1,234.56)`  `($1,234.56)`  `(1,234.56)-`  `12.34 A`  `12.34-A`  `12.34 X`  `12.34 N`  `.88`  `.88 FS`
+ *
+ * Trailing tax-flag letters: A (taxed), X (taxed, Walmart), N (non-taxable),
+ * E (various store-specific, e.g. Costco grocery), T, O, B, R, F (various store-specific flags).
  */
-const PRICE_REGEX = /^(?:(?:-?\$?\d{1,3}(?:,\d{3})*\.\d{2})|\(\$?\d{1,3}(?:,\d{3})*\.\d{2}\))(?:-(?!A))?(?:[ -]A)?$/;
+const PRICE_REGEX = /^(?:(?:-?\$?\d{0,3}(?:,\d{3})*\.\d{2})|\(\$?\d{1,3}(?:,\d{3})*\.\d{2}\))(?:-(?![A-Z]))?(?:[ -][AXNTOBREF])?$/i;
 
 export function isPrice(text: string): boolean {
   return PRICE_REGEX.test(text.trim());
@@ -142,7 +145,7 @@ export function isPrice(text: string): boolean {
  * Returns the bare price string or null if no flag pattern is found.
  */
 export function tryStripTaxFlag(text: string): string | null {
-  const m = text.trim().match(/^[FNTXBOR](\$?\d{1,3}(?:,\d{3})*\.\d{2})$/i);
+  const m = text.trim().match(/^[FNTXBORE](\$?\d{0,3}(?:,\d{3})*\.\d{2})$/i);
   return m && isPrice(m[1]) ? m[1] : null;
 }
 
@@ -164,7 +167,8 @@ const DISCOUNT_KEYWORDS_PRICE = [
   '-'
 ];
 const TAXED_ITEM_KEYWORDS_PRICE = [
-  'A'
+  'A',
+  'X',
 ];
 
 /**
@@ -221,8 +225,9 @@ export function classifyLine(text: string, price: string | null): LineType {
     if (lower.includes('cash balance')) return 'info';
     // "TOTAL DISCOUNTS" is a savings summary, not the receipt total
     if (lower.includes('discounts')) return 'info';
-    // "TOTAL TAX" / "TOTAL SAVINGS" are summary labels, not the receipt total
-    if (/\btotal\s+tax\b/.test(lower)) return 'info';
+    // "TOTAL TAX" is a tax line, not the receipt total
+    if (/\btotal\s+tax\b/.test(lower)) return 'tax';
+    // "TOTAL SAVINGS" is a savings summary, not the receipt total
     if (/\btotal\s+savings?\b/.test(lower)) return 'info';
     return 'total';
   }
@@ -240,6 +245,8 @@ export function classifyLine(text: string, price: string | null): LineType {
   // "Sale Price" lines show the post-discount price — informational, not a separate item
   if (lower.includes('sale price')) return 'info';
   if (TENDER_KEYWORDS_RE.some((re) => re.test(lower))) return 'tender';
+  // Weight/tare description lines (e.g. "1.08 lb @ 1.99 /lb TARE = .01") are not items
+  if (/\btare\b/.test(lower)) return 'info';
   if (!price) return 'info';
   if (DISCOUNT_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'discount';
   if (TAXED_ITEM_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'taxed_item';
@@ -279,6 +286,32 @@ export function parsePrice(raw: string | null): number {
   return (hasParens || hasTrailingMinus || hasLeadingMinus) ? -Math.abs(value) : value;
 }
 
+// ── Tax rate line parsing ─────────────────────────────────────────────────────
+
+/**
+ * Parse an explicit tax rate breakdown line like "A 8.50% TAX" with price "0.55".
+ * Returns a TaxRateInfo or null if the line doesn't match.
+ */
+export function parseTaxRateLine(text: string, price: string | null): { code: string; rate: number; amount: number } | null {
+  const m = text.match(/\b([A-Z])\s+(\d+(?:\.\d+)?)%\s+TAX\b/i);
+  if (!m || price === null) return null;
+  return {
+    code: m[1].toUpperCase(),
+    rate: parseFloat(m[2]) / 100,
+    amount: parsePrice(price),
+  };
+}
+
+/**
+ * Extract the tax code letter from a price suffix, e.g. "23.99 E" → "E".
+ * Returns null if no tax code suffix is found.
+ */
+export function extractTaxCode(price: string | null): string | null {
+  if (!price) return null;
+  const m = price.trim().match(/[ -]([AXNTOBREF])$/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
 // ── Receipt result types ──────────────────────────────────────────────────────
 
 export type Severity = 'info' | 'warn' | 'error';
@@ -302,6 +335,16 @@ export interface CheckResult {
   penalty: number;
 }
 
+/** Explicit tax rate information parsed from receipt tax breakdown lines. */
+export interface TaxRateInfo {
+  /** Tax code letter, e.g. "A", "E". */
+  code: string;
+  /** Tax rate as a decimal, e.g. 0.085 for 8.50%. */
+  rate: number;
+  /** Dollar amount of tax for this code. */
+  amount: number;
+}
+
 /** A receipt item with its name, price, and optional discount applied. */
 export interface ReceiptItem {
   /** Item name from OCR. */
@@ -314,6 +357,8 @@ export interface ReceiptItem {
   finalPrice: number;
   /** Whether this item is taxed (price ends with 'A'). */
   taxed: boolean;
+  /** Tax code letter if detected (e.g. "A", "E"), or null. */
+  taxCode: string | null;
   /** Raw price string from OCR. */
   rawPrice: string;
   /** Raw discount price string from OCR, if a discount was applied. */
@@ -376,6 +421,9 @@ export interface Receipt {
   calculatedSubtotal: number;
   /** Calculated tax rate: ocrTax / taxedItemsValue, or null if not computable. */
   taxRate: number | null;
+
+  /** Explicit tax rates parsed from receipt breakdown lines (e.g. "A 8.50% TAX 0.55"). */
+  taxRates: TaxRateInfo[];
 
   /** Largest tender / payment amount detected, or null. */
   tenderAmount: number | null;

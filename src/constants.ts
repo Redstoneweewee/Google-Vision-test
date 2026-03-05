@@ -94,7 +94,7 @@ export const LINE_CLUSTER_Y_THRESHOLD_FACTOR = 0.6;
  * 1.5× gives a comfortable margin before triggering the more expensive
  * RANSAC path.
  */
-export const RANSAC_SPLIT_THRESHOLD_FACTOR = 1.5;
+export const RANSAC_SPLIT_THRESHOLD_FACTOR = 1.2;
 
 /**
  * **Used in:** `ransacSplitCluster` – minimum cluster size to attempt

@@ -7,8 +7,8 @@ import path from 'path';
 
 import { reconstructLines } from './algorithm';
 import type { ReconstructionResult } from './algorithm';
-import type { ReceiptLine, Point, Receipt, ReceiptItem, ReceiptConfidence, LineType, WordBox } from './utils';
-import { rotatePoint, parsePrice } from './utils';
+import type { ReceiptLine, Point, Receipt, ReceiptItem, ReceiptConfidence, LineType, WordBox, TaxRateInfo } from './utils';
+import { rotatePoint, parsePrice, parseTaxRateLine, extractTaxCode } from './utils';
 import { checkConfidence, formatConfidenceReport, colorBold, colorDim, colorPass, colorWarn, colorError, colorCyan } from './checks';
 import { MAX_IMAGE_DIMENSION } from './constants';
 
@@ -104,11 +104,7 @@ async function saveAnnotatedImage(
       const color = (lineType === 'info' || lineType === 'tender') ? '#888888' : '#00FF00';
       return `
       <polygon points="${pts}"
-        fill="none" stroke="${color}" stroke-width="2"/>
-      <text x="${lx}" y="${Math.max(ly - 4, 12)}"
-        font-family="monospace" font-size="13"
-        fill="${color}" stroke="black" stroke-width="0.6"
-        paint-order="stroke">${label}</text>`;
+        fill="none" stroke="${color}" stroke-width="2"/>`;
     })
     .join('\n');
 
@@ -142,12 +138,14 @@ function buildItems(lines: ReceiptLine[]): ReceiptItem[] {
 
     if (line.lineType === 'untaxed_item' || line.lineType === 'taxed_item') {
       const originalPrice = Math.abs(parsePrice(line.price));
+      const taxCode = extractTaxCode(line.price);
       items.push({
         name: line.itemName ?? line.text,
         originalPrice,
         discount: 0,
         finalPrice: originalPrice,
         taxed: line.lineType === 'taxed_item',
+        taxCode,
         rawPrice: line.price ?? '',
         rawDiscount: null,
       });
@@ -199,6 +197,29 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
   // ── Reconstruct receipt lines ─────────────────────────────────────────
   const { lines: receiptLines, angle } = reconstructLines(detections.slice(1));
 
+  // ── Parse explicit tax rate breakdown lines ───────────────────────────
+  // Detect lines like "A 8.50% TAX" with price "0.55" to discover tax codes.
+  const taxRates: TaxRateInfo[] = [];
+  for (const line of receiptLines) {
+    if (line.lineType === 'tax') {
+      const info = parseTaxRateLine(line.text, line.price);
+      if (info) taxRates.push(info);
+    }
+  }
+
+  // If explicit tax codes were discovered, reclassify items whose price
+  // suffix matches a discovered tax code from untaxed to taxed.
+  if (taxRates.length > 0) {
+    const discoveredCodes = new Set(taxRates.map((r) => r.code));
+    for (const line of receiptLines) {
+      if (line.lineType !== 'untaxed_item' || line.price === null) continue;
+      const code = extractTaxCode(line.price);
+      if (code && discoveredCodes.has(code)) {
+        line.lineType = 'taxed_item';
+      }
+    }
+  }
+
   // ── Build items (with discounts applied) ──────────────────────────────
   const items = buildItems(receiptLines);
 
@@ -234,12 +255,14 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
 
     const values = taxLines.map((l) => parsePrice(l.price));
     const maxVal = Math.max(...values);
-    const maxIdx = values.indexOf(maxVal);
-    const othersSum = values.reduce((s, v, i) => (i === maxIdx ? s : s + v), 0);
+
+    // Exclude ALL instances of the max value (handles duplicates like TAX + TOTAL TAX)
+    const nonMaxValues = values.filter((v) => Math.abs(v - maxVal) >= 0.01);
+    const nonMaxSum = nonMaxValues.reduce((s, v) => s + v, 0);
 
     // If the smaller lines sum ≈ the largest, the largest is a total line
     // and the others are breakdowns → use just the largest.
-    if (Math.abs(othersSum - maxVal) < 0.02) {
+    if (nonMaxValues.length > 0 && Math.abs(nonMaxSum - maxVal) < 0.02) {
       return maxVal;
     }
 
@@ -250,17 +273,52 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
   const ocrTotal = findOcrValue('total');
 
   // ── Tax rate ──────────────────────────────────────────────────────────
-  let taxRate: number | null = null;
-  if (ocrTax !== null && taxedItemsValue > 0) {
-    taxRate = ocrTax / taxedItemsValue;
-    console.log(`Estimated tax rate from OCR tax line: ${(taxRate * 100).toFixed(2)}%`);
+  // Determine the tax amount: prefer the OCR tax line, fall back to
+  // total − subtotal when only those two are available.
+  let taxAmount: number | null = null;
+  if (ocrTax !== null) {
+    taxAmount = ocrTax;
+  } else if (ocrSubtotal !== null && ocrTotal !== null) {
+    const implied = ocrTotal - ocrSubtotal;
+    if (implied > 0) taxAmount = implied;
   }
-  else if(ocrSubtotal !== null && ocrTotal !== null) {
-    const impliedTax = ocrTotal - ocrSubtotal;
-    if (impliedTax > 0 && taxedItemsValue > 0) {
-      taxRate = impliedTax / taxedItemsValue;
+
+  // Determine the taxable base: prefer taxed-items sum, fall back to
+  // OCR subtotal (handles receipts where all items are classified as
+  // untaxed but tax was still charged).
+  const taxableBase =
+    taxedItemsValue > 0
+      ? taxedItemsValue
+      : ocrSubtotal !== null && ocrSubtotal > 0
+        ? ocrSubtotal
+        : null;
+
+  let taxRate: number | null = null;
+  if (taxRates.length > 0) {
+    // Explicit tax rate lines found — use them directly.
+    // For the single taxRate field, use a weighted effective rate.
+    const totalTaxAmt = taxRates.reduce((s, r) => s + r.amount, 0);
+    const totalTaxedBase = taxedItemsValue > 0 ? taxedItemsValue : (ocrSubtotal ?? 0);
+    if (totalTaxedBase > 0) {
+      const rawPct = (totalTaxAmt / totalTaxedBase) * 100;
+      const roundedPct = Math.round(rawPct / 0.05) * 0.05;
+      taxRate = roundedPct / 100;
     }
-    console.log(`Estimated tax rate from OCR subtotal and total: ${taxRate !== null ? (taxRate * 100).toFixed(2) + '%' : '(not computable)'}`);
+    console.log(`Explicit tax rates found:`);
+    for (const tr of taxRates) {
+      console.log(`  ${tr.code}: ${(tr.rate * 100).toFixed(2)}% = $${tr.amount.toFixed(2)}`);
+    }
+    if (taxRate !== null) {
+      console.log(`Effective blended tax rate: ${(taxRate * 100).toFixed(2)}%`);
+    }
+  } else if (taxAmount !== null && taxableBase !== null && taxableBase > 0) {
+    // Round to nearest 0.05% (e.g. 7.00%, 8.25%, 6.85%)
+    const rawPct = (taxAmount / taxableBase) * 100;
+    const roundedPct = Math.round(rawPct / 0.05) * 0.05;
+    taxRate = roundedPct / 100;
+    console.log(`Estimated tax rate: ${roundedPct.toFixed(2)}% (raw ${rawPct.toFixed(4)}%)`);
+  } else {
+    console.log(`Estimated tax rate: (not computable)`);
   }
 
   const calculatedSubtotal = untaxedItemsValue + taxedItemsValue;
@@ -286,6 +344,8 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
     ocrTotal,
     taxRate,
     tenderAmount,
+    taxRates,
+    items,
   );
 
   // ── Save annotated image ──────────────────────────────────────────────
@@ -311,6 +371,7 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
     ocrTotal,
     calculatedSubtotal,
     taxRate,
+    taxRates,
     tenderAmount,
     confidence,
   };
@@ -341,7 +402,9 @@ function printReceipt(receipt: Receipt): void {
   console.log(`\n${colorBold('=== Items (with discounts applied) ===')}`);
   for (const item of receipt.items) {
     const disc = item.discount !== 0 ? colorWarn(`  disc: ${item.discount.toFixed(2)}`) : '';
-    const taxFlag = item.taxed ? colorDim(' [T]') : '';
+    const taxFlag = item.taxed
+      ? colorDim(item.taxCode ? ` [T:${item.taxCode}]` : ' [T]')
+      : '';
     console.log(`  ${item.name.padEnd(35)} ${item.finalPrice.toFixed(2)}${disc}${taxFlag}`);
   }
 
@@ -355,6 +418,12 @@ function printReceipt(receipt: Receipt): void {
   console.log(`  OCR tax:              $${receipt.ocrTax?.toFixed(2) ?? colorDim('(not found)')}`);
   console.log(`  OCR total:            $${receipt.ocrTotal?.toFixed(2) ?? colorDim('(not found)')}`);
   console.log(`  Tax rate:             ${receipt.taxRate !== null ? (receipt.taxRate * 100).toFixed(2) + '%' : colorDim('(not computable)')}`);
+  if (receipt.taxRates.length > 0) {
+    console.log(`  Tax rate breakdown:`);
+    for (const tr of receipt.taxRates) {
+      console.log(`    Code ${tr.code}: ${(tr.rate * 100).toFixed(2)}% = $${tr.amount.toFixed(2)}`);
+    }
+  }
   console.log(`  Tender amount:        $${receipt.tenderAmount?.toFixed(2) ?? colorDim('(not found)')}`);
 
   // ── Colored confidence report with suggestions ──────────────────────────

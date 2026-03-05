@@ -506,10 +506,11 @@ function assignPrice(
     let price = stripped ?? rawText.trim();
 
     // Absorb trailing suffix tokens that OCR may have split from the price.
-    // Known suffixes: "-" (discount), "A" (taxed item), "-A" (taxed item).
+    // Known suffixes: "-" (discount), single-letter tax flags (A, X, N, T, O, B, R, F),
+    // or dash+flag combos like "-A".
     for (let j = i + 1; j < ordered.length && j <= i + 2; j++) {
       const suf = ordered[j].text.trim();
-      if (!/^(-|A|-A)$/i.test(suf)) break;
+      if (!/^(-|[AXNTOBREF]|-[AXNTOBREF])$/i.test(suf)) break;
 
       // Try joining: direct concat, space, dash — pick first valid match
       const upper = suf.toUpperCase();
@@ -616,7 +617,7 @@ function splitTaxBalLine(lines: ReceiptLine[]): void {
   console.debug(`[DEBUG]    splitTaxBalLine: scanning for combined TAX/BAL lines...`);
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
-    if (l.lineType !== 'tax' || l.price !== null) continue;
+    if (l.lineType !== 'tax') continue;
 
     // Try patterns like "TAX .93 BAL 45.44" or "TAX 1.23 BAL 56.78"
     const m = l.text.match(/\btax\s+(\d*\.?\d+)\s+bal(?:ance)?\s+(\d+\.\d{2})\b/i);
@@ -1229,15 +1230,31 @@ export function reconstructLines(
   for (let i = 0; i < tentativeLines.length; i++) {
     const angle = resolvedAngles[i];
     const rotated = rotateBoxes(tentativeLines[i], angle);
-    const splits = ransacSplitCluster(rotated, medH);
-    if (splits.length > 1) {
-      console.debug(`[DEBUG]    RANSAC split tentative line ${i} (${tentativeLines[i].length} words) into ${splits.length} sub-lines`);
-      for (let s = 0; s < splits.length; s++) {
-        console.debug(`[DEBUG]      Sub-line ${s}: ${splits[s].length} words → "${splits[s].map(w => w.text).join(' ')}"`);
+
+    // First, try Y-clustering to separate words from different physical lines.
+    // The neighbor graph can merge adjacent receipt lines when line spacing is
+    // tight; Y-clustering with the standard threshold catches these cases even
+    // when the overall Y range is too small to trigger RANSAC.
+    const yClusters = clusterIntoLines(rotated, medH);
+    if (yClusters.length > 1) {
+      console.debug(`[DEBUG]    Y-cluster split tentative line ${i} (${tentativeLines[i].length} words) into ${yClusters.length} sub-lines`);
+      for (let s = 0; s < yClusters.length; s++) {
+        console.debug(`[DEBUG]      Sub-line ${s}: ${yClusters[s].length} words → "${yClusters[s].map(w => w.text).join(' ')}"`);
       }
     }
-    for (const split of splits) {
-      finalBuckets.push({ boxes: split, angle });
+
+    // Then, try RANSAC on each Y-cluster for any remaining merged lines
+    for (const cluster of yClusters) {
+      const splits = ransacSplitCluster(cluster, medH);
+      if (splits.length > 1) {
+        console.debug(`[DEBUG]    RANSAC split (post Y-cluster) line ${i} (${cluster.length} words) into ${splits.length} sub-lines`);
+        for (let s = 0; s < splits.length; s++) {
+          console.debug(`[DEBUG]      Sub-line ${s}: ${splits[s].length} words → "${splits[s].map(w => w.text).join(' ')}"`);
+        }
+      }
+      for (const split of splits) {
+        finalBuckets.push({ boxes: split, angle });
+      }
     }
   }
   console.debug(`[DEBUG]    → ${finalBuckets.length} final line buckets (from ${tentativeLines.length} tentative)`);

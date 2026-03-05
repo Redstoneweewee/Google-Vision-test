@@ -6,7 +6,7 @@
  * user-friendly summary string is produced with colored output.
  */
 
-import type { CheckResult, ReceiptConfidence, Severity } from './utils';
+import type { CheckResult, ReceiptConfidence, Severity, TaxRateInfo, ReceiptItem } from './utils';
 
 // ── ANSI color helpers ───────────────────────────────────────────────────────
 
@@ -67,6 +67,10 @@ export interface CheckContext {
   ocrTax: number | null;
   ocrTotal: number | null;
   taxRate: number | null;
+  /** Explicit tax rate breakdowns from receipt (e.g. "A 8.50% TAX 0.55"). */
+  taxRates: TaxRateInfo[];
+  /** Parsed items with tax codes. */
+  items: ReceiptItem[];
   /** Tender amount from payment lines (card charge, cash, etc.) if found. */
   tenderAmount: number | null;
 }
@@ -154,6 +158,10 @@ function checkCalcSubtotalVsTotalMinusTax(ctx: CheckContext): CheckResult | null
 
 /** 5) X ≈ TaxedBase × R — tax amount consistency. */
 function checkTaxConsistency(ctx: CheckContext): CheckResult | null {
+  // If explicit per-code tax rates exist, skip the single-rate check
+  // (the per-code check handles it instead).
+  if (ctx.taxRates.length > 0) return null;
+
   const { ocrTax, taxedItemsValue, taxRate } = ctx;
   if (ocrTax === null || taxRate === null || taxedItemsValue <= 0) return null;
   const expectedTax = Math.round(taxedItemsValue * taxRate * 100) / 100;
@@ -170,20 +178,72 @@ function checkTaxConsistency(ctx: CheckContext): CheckResult | null {
   };
 }
 
+/** 5b) Per-code tax consistency — verify each explicit tax code. */
+function checkPerCodeTaxConsistency(ctx: CheckContext): CheckResult[] {
+  if (ctx.taxRates.length === 0) return [];
+
+  const results: CheckResult[] = [];
+  for (const tr of ctx.taxRates) {
+    // Sum items with this tax code
+    const codeItems = ctx.items.filter((i) => i.taxCode === tr.code);
+    const codeBase = codeItems.reduce((s, i) => s + i.finalPrice, 0);
+
+    if (codeBase <= 0) {
+      results.push({
+        id: `tax_consistency_${tr.code}`,
+        severity: 'warn',
+        message: `Tax code ${tr.code} (${(tr.rate * 100).toFixed(2)}%): no items found with this code, but receipt shows $${tr.amount.toFixed(2)} tax`,
+        penalty: 2,
+      });
+      continue;
+    }
+
+    const expectedTax = Math.round(codeBase * tr.rate * 100) / 100;
+    const delta = Math.abs(tr.amount - expectedTax);
+    const ok = delta < CENTS_TOLERANCE;
+    results.push({
+      id: `tax_consistency_${tr.code}`,
+      severity: ok ? 'info' : (delta > 0.1 ? 'error' : 'warn'),
+      message: ok
+        ? `Tax code ${tr.code}: $${tr.amount.toFixed(2)} ~= items ($${codeBase.toFixed(2)}) x ${(tr.rate * 100).toFixed(2)}% = $${expectedTax.toFixed(2)}`
+        : `Tax code ${tr.code}: $${tr.amount.toFixed(2)} != items ($${codeBase.toFixed(2)}) x ${(tr.rate * 100).toFixed(2)}% = $${expectedTax.toFixed(2)} — off by $${delta.toFixed(2)}`,
+      delta,
+      penalty: ok ? 0 : 3 + delta * 200,
+    });
+  }
+  return results;
+}
+
 /** 6) Is the inferred tax rate plausible (0 – 15%)? */
-function checkTaxRatePlausibility(ctx: CheckContext): CheckResult | null {
+function checkTaxRatePlausibility(ctx: CheckContext): CheckResult[] {
+  // If explicit per-code rates exist, check each one
+  if (ctx.taxRates.length > 0) {
+    return ctx.taxRates.map((tr) => {
+      const pct = tr.rate * 100;
+      const ok = tr.rate >= 0 && tr.rate <= MAX_PLAUSIBLE_TAX_RATE;
+      return {
+        id: `tax_rate_plausibility_${tr.code}`,
+        severity: 'info' as Severity,
+        message: ok
+          ? `Tax code ${tr.code} rate ${pct.toFixed(2)}% is plausible (0-15%)`
+          : `Tax code ${tr.code} rate ${pct.toFixed(2)}% is outside plausible range (0-15%)`,
+        penalty: 0,
+      };
+    });
+  }
+
   const { taxRate } = ctx;
-  if (taxRate === null) return null;
+  if (taxRate === null) return [];
   const pct = taxRate * 100;
   const ok = taxRate >= 0 && taxRate <= MAX_PLAUSIBLE_TAX_RATE;
-  return {
+  return [{
     id: 'tax_rate_plausibility',
     severity: 'info',
     message: ok
       ? `Inferred tax rate ${pct.toFixed(2)}% is plausible (0-15%)`
       : `Inferred tax rate ${pct.toFixed(2)}% is outside plausible range (0-15%) — possible taxability misclassification or OCR error`,
     penalty: 0,
-  };
+  }];
 }
 
 /** 7) Solve-for-missing-one — estimate what's missing. */
@@ -329,6 +389,8 @@ export function checkConfidence(
   ocrTotal: number | null,
   taxRate: number | null,
   tenderAmount: number | null = null,
+  taxRates: TaxRateInfo[] = [],
+  items: ReceiptItem[] = [],
 ): ReceiptConfidence {
   const ctx: CheckContext = {
     calculatedSubtotal,
@@ -338,6 +400,8 @@ export function checkConfidence(
     ocrTax,
     ocrTotal,
     taxRate,
+    taxRates,
+    items,
     tenderAmount,
   };
 
@@ -347,7 +411,8 @@ export function checkConfidence(
     checkCalcSubtotalVsOcrSubtotal(ctx),
     checkCalcSubtotalVsTotalMinusTax(ctx),
     checkTaxConsistency(ctx),
-    checkTaxRatePlausibility(ctx),
+    ...checkPerCodeTaxConsistency(ctx),
+    ...checkTaxRatePlausibility(ctx),
     checkTenderVsTotal(ctx),
     checkMissingElement(ctx),
     ...checkMissingSummaryLines(ctx),
@@ -441,8 +506,7 @@ function getSuggestion(chk: CheckResult): string {
       return `The tax amount is significantly off from the expected value. Either the tax rate, the taxable item classification, or the OCR'd tax amount may be wrong. Verify the tax line on the receipt.`;
 
     // ── Check 6: Tax rate plausibility ──────────────────────────────────
-    case 'tax_rate_plausibility':
-      if (chk.severity === 'info') {
+    case 'tax_rate_plausibility':      if (chk.severity === 'info') {
         return 'The inferred tax rate is within the normal US range (0-15%) — looks reasonable.';
       }
       return 'The inferred tax rate is outside the normal range. This probably means some items are misclassified as taxed/untaxed, or the tax line was misread. Check items with [T] flags.';
@@ -469,6 +533,20 @@ function getSuggestion(chk: CheckResult): string {
       return `The payment amount differs from the total by $${chk.delta?.toFixed(2) ?? '?'}. This may indicate a tip, split payment, or cash/change math error. Compare the payment section on the receipt.`;
 
     default:
+      // Per-code tax consistency checks (tax_consistency_A, tax_consistency_E, etc.)
+      if (chk.id.startsWith('tax_consistency_')) {
+        if (chk.severity === 'info') {
+          return 'Per-code tax amount matches the expected calculation — tax breakdown is accurate.';
+        }
+        if (chk.severity === 'warn') {
+          return `Per-code tax is off by $${chk.delta?.toFixed(2) ?? '?'} — could be per-line rounding or a misclassified item.`;
+        }
+        return `Per-code tax is significantly off. Check that items are assigned the correct tax code.`;
+      }
+      // Per-code tax rate plausibility checks
+      if (chk.id.startsWith('tax_rate_plausibility_')) {
+        return 'The per-code tax rate is within the normal US range (0-15%) — looks reasonable.';
+      }
       return chk.message;
   }
 }
