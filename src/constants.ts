@@ -266,3 +266,17 @@ export const NEIGHBOR_MAX_HEIGHT_RATIO = 2.0;
  */
 export const ORPHAN_SEARCH_RADIUS = 4;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Image preprocessing
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * **Used in:** `detectTextLocal` – image resizing before OCR.
+ *
+ * Maximum dimension (width or height) in pixels for the image sent to the
+ * Vision API.  Images larger than this are downscaled (preserving aspect
+ * ratio) before detection.  2048 px is a good trade-off between OCR
+ * accuracy and API cost/latency.
+ */
+export const MAX_IMAGE_DIMENSION = 2048;
+

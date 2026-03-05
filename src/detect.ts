@@ -7,9 +7,10 @@ import path from 'path';
 
 import { reconstructLines } from './algorithm';
 import type { ReconstructionResult } from './algorithm';
-import type { ReceiptLine, Point, Receipt, ReceiptItem, ReceiptConfidence } from './utils';
+import type { ReceiptLine, Point, Receipt, ReceiptItem, ReceiptConfidence, LineType, WordBox } from './utils';
 import { rotatePoint, parsePrice } from './utils';
 import { checkConfidence, formatConfidenceReport, colorBold, colorDim, colorPass, colorWarn, colorError, colorCyan } from './checks';
+import { MAX_IMAGE_DIMENSION } from './constants';
 
 type TextAnnotation = protos.google.cloud.vision.v1.IEntityAnnotation;
 type Vertex = protos.google.cloud.vision.v1.IVertex;
@@ -21,60 +22,49 @@ const client = new vision.ImageAnnotatorClient({
 
 interface LineAnnotation {
   description: string;
+  lineType: LineType;
   boundingPoly: { vertices: Required<Vertex>[] };
 }
 
 /**
- * Builds a rotated bounding box for a line:
- *   1. Collect all original vertices from every word in the line.
- *   2. Rotate them by −θ into the straightened coordinate system.
- *   3. Compute the axis-aligned bounding box in that space.
- *   4. Rotate the 4 AABB corners back by +θ into image space.
+ * Builds a polygon for a line by tracing the bounding boxes of each word:
+ *   - Top edges from left to right (TL → TR for each word)
+ *   - Bottom edges from right to left (BR → BL for each word)
  *
- * The result is a tilted rectangle that follows the text baseline.
+ * This produces a tight outline that follows each word's actual OCR box
+ * rather than a single merged rectangle.
  */
-function mergeRotatedBoundingBox(
-  lineWords: TextAnnotation[],
-  angle: number,
+function buildLinePolygon(
+  words: WordBox[],
 ): LineAnnotation['boundingPoly'] {
-  const allVerts = lineWords.flatMap((w) =>
-    (w.boundingPoly?.vertices ?? []).map((v) => ({
-      x: v.x ?? 0,
-      y: v.y ?? 0,
-    })),
-  );
-
-  if (allVerts.length === 0) {
+  if (words.length === 0) {
     const zero = { x: 0, y: 0 } as Required<Vertex>;
     return { vertices: [zero, zero, zero, zero] };
   }
 
-  // Rotate into straightened space
-  const rotated = allVerts.map((v) => rotatePoint(v, -angle));
-  const rxs = rotated.map((v) => v.x);
-  const rys = rotated.map((v) => v.y);
-  const minX = Math.min(...rxs);
-  const maxX = Math.max(...rxs);
-  const minY = Math.min(...rys);
-  const maxY = Math.max(...rys);
+  // Sort words left to right
+  const sorted = [...words].sort((a, b) => a.left - b.left);
 
-  // AABB corners in rotated space (TL, TR, BR, BL)
-  const corners: Point[] = [
-    { x: minX, y: minY },
-    { x: maxX, y: minY },
-    { x: maxX, y: maxY },
-    { x: minX, y: maxY },
-  ];
+  const topPath: Required<Vertex>[] = [];
+  const bottomReversed: Required<Vertex>[] = [];
 
-  // Rotate back into image space
-  const imageCorners = corners.map((c) => rotatePoint(c, angle));
+  for (const word of sorted) {
+    const verts = (word.original.boundingPoly?.vertices ?? []).map((v) => ({
+      x: v.x ?? 0,
+      y: v.y ?? 0,
+    })) as Required<Vertex>[];
 
-  return {
-    vertices: imageCorners.map((c) => ({
-      x: Math.round(c.x),
-      y: Math.round(c.y),
-    })) as Required<Vertex>[],
-  };
+    if (verts.length >= 4) {
+      // Vertices: [TL(0), TR(1), BR(2), BL(3)]
+      topPath.push(verts[0], verts[1]);
+      bottomReversed.push(verts[3], verts[2]);
+    }
+  }
+
+  // Reverse the bottom path so it goes right → left
+  bottomReversed.reverse();
+
+  return { vertices: [...topPath, ...bottomReversed] };
 }
 
 /**
@@ -95,13 +85,14 @@ function formatLineLabel(line: ReceiptLine): string {
  */
 async function saveAnnotatedImage(
   inputPath: string,
+  imageBuffer: Buffer,
   lineAnnotations: LineAnnotation[]
 ): Promise<void> {
-  const meta = await sharp(inputPath).metadata();
+  const meta = await sharp(imageBuffer).metadata();
   const { width, height } = meta;
 
   const polygons = lineAnnotations
-    .map(({ description, boundingPoly: { vertices } }) => {
+    .map(({ description, lineType, boundingPoly: { vertices } }) => {
       const pts = vertices.map((v) => `${v.x},${v.y}`).join(' ');
       const lx = vertices[0].x ?? 0;
       const ly = vertices[0].y ?? 0;
@@ -110,12 +101,13 @@ async function saveAnnotatedImage(
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
+      const color = (lineType === 'info' || lineType === 'tender') ? '#888888' : '#00FF00';
       return `
       <polygon points="${pts}"
-        fill="none" stroke="#00FF00" stroke-width="2"/>
+        fill="none" stroke="${color}" stroke-width="2"/>
       <text x="${lx}" y="${Math.max(ly - 4, 12)}"
         font-family="monospace" font-size="13"
-        fill="#00FF00" stroke="black" stroke-width="0.6"
+        fill="${color}" stroke="black" stroke-width="0.6"
         paint-order="stroke">${label}</text>`;
     })
     .join('\n');
@@ -130,7 +122,7 @@ async function saveAnnotatedImage(
   const dir = path.dirname(inputPath);
   const outPath = path.join(dir, `${base}_annotated${ext}`);
 
-  await sharp(inputPath)
+  await sharp(imageBuffer)
     .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
     .toFile(outPath);
 
@@ -186,7 +178,17 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
     throw new Error(`File not found: ${resolvedPath}`);
   }
 
-  const [result] = await client.textDetection(resolvedPath);
+  // ── Resize image if needed ──────────────────────────────────────────
+  const imageBuffer = await sharp(resolvedPath)
+    .resize({
+      width: MAX_IMAGE_DIMENSION,
+      height: MAX_IMAGE_DIMENSION,
+      fit: 'inside',
+      withoutEnlargement: true,
+    })
+    .toBuffer();
+
+  const [result] = await client.textDetection({ image: { content: imageBuffer } });
   const detections = result.textAnnotations;
 
   if (!detections || detections.length === 0) {
@@ -262,12 +264,10 @@ export async function detectTextLocal(filePath: string): Promise<Receipt> {
   // ── Save annotated image ──────────────────────────────────────────────
   const lineAnnotations: LineAnnotation[] = receiptLines.map((line) => ({
     description: formatLineLabel(line),
-    boundingPoly: mergeRotatedBoundingBox(
-      line.words.map((w) => w.original),
-      line.angle,
-    ),
+    lineType: line.lineType,
+    boundingPoly: buildLinePolygon(line.words),
   }));
-  await saveAnnotatedImage(resolvedPath, lineAnnotations);
+  await saveAnnotatedImage(resolvedPath, imageBuffer, lineAnnotations);
 
   return {
     lines: receiptLines,

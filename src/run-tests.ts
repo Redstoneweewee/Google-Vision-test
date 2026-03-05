@@ -234,7 +234,12 @@ interface TestResult {
 
   // ── Write full output file ─────────────────────────────────────────────
 
-  const outPath = path.join(projectRoot, 'test_results.txt');
+  // Find next available test_results_N.txt
+  let iteration = 0;
+  while (fs.existsSync(path.join(projectRoot, `test_results_${iteration}.txt`))) {
+    iteration++;
+  }
+  const outPath = path.join(projectRoot, `test_results_${iteration}.txt`);
   const lines: string[] = [];
 
   lines.push('='.repeat(80));
