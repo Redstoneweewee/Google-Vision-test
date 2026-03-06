@@ -232,7 +232,7 @@ export const NEIGHBOR_Y_OVERLAP_MIN = 0.6;
  * are often 5–10× text height).  The y-overlap constraint prevents this
  * from accidentally linking boxes on different lines.
  */
-export const NEIGHBOR_MAX_X_GAP_FACTOR = 8;
+export const NEIGHBOR_MAX_X_GAP_FACTOR = 14;
 
 /**
  * **Used in:** `buildTentativeLines` – height-similarity filter.
@@ -243,6 +243,31 @@ export const NEIGHBOR_MAX_X_GAP_FACTOR = 8;
  * or logos.  Tighten to 1.5 if you're getting false connections to headers.
  */
 export const NEIGHBOR_MAX_HEIGHT_RATIO = 2.0;
+
+/**
+ * **Used in:** `buildTentativeLines` – phase 1 short-range gap limit.
+ *
+ * Maximum gap (in multiples of median word height) for the conservative
+ * first pass of neighbor linking.  Phase 1 only connects words that are
+ * close together (text-to-text) so that each tentative line has a
+ * reliable direction vector.  4× is generous enough for normal inter-word
+ * gaps (typically < 1–2× medH) but well short of the text-to-price gap
+ * (often 5–14× medH), preventing prices from attaching to the wrong line.
+ */
+export const NEIGHBOR_SHORT_GAP_FACTOR = 4;
+
+/**
+ * **Used in:** `buildTentativeLines` – phase 2 vector y-tolerance.
+ *
+ * Maximum deviation (in multiples of median word height) between a
+ * candidate box's actual Y centre and the Y predicted by extending the
+ * source line's direction vector.  0.35× is tight enough to distinguish
+ * adjacent receipt lines (typically 1.2–1.5× medH apart) while
+ * tolerating normal OCR jitter and slight curvature.  Tightened from
+ * 0.5 to prevent wrong connections on distorted/held receipts
+ * (albertsons/held_1, subway_held_distorted_1).
+ */
+export const VECTOR_Y_TOLERANCE_FACTOR = 0.35;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Edge case – Orphan price search radius

@@ -128,12 +128,17 @@ export function angleBetween(a: Point, b: Point): number {
 
 /**
  * Matches common receipt price formats:
- * `12.34`  `-12.34`  `12.34-`  `$1,234.56`  `-$1,234.56`  `(1,234.56)`  `($1,234.56)`  `(1,234.56)-`  `12.34 A`  `12.34-A`  `12.34 X`  `12.34 N`  `.88`  `.88 FS`
+ * `12.34`  `-12.34`  `12.34-`  `$1,234.56`  `-$1,234.56`  `(1,234.56)`  `($1,234.56)`  `(1,234.56)-`
+ * `12.34 A`  `12.34-A`  `12.34 X`  `12.34 N`
+ * `.88`  `.8888`  `.88 FS`
+ *
+ * Supports 2–4 decimal places.
  *
  * Trailing tax-flag letters: A (taxed), X (taxed, Walmart), N (non-taxable),
- * E (various store-specific, e.g. Costco grocery), T, O, B, R, F (various store-specific flags).
+ * E, T, O, B, R, F (various store-specific flags).
  */
-const PRICE_REGEX = /^(?:(?:-?\$?\d{0,3}(?:,\d{3})*\.\d{2})|\(\$?\d{1,3}(?:,\d{3})*\.\d{2}\))(?:-(?![A-Z]))?(?:[ -][AXNTOBREF])?$/i;
+const PRICE_REGEX =
+/^(?:(?:-?\$?(?:\d{1,3}(?:,\d{3})*|\d+)\.\d{2,4})|\.\d{2,4}|\(\$?(?:\d{1,3}(?:,\d{3})*|\d+)\.\d{2,4}\))(?:-(?![A-Z]))?(?:[ -][A-Z]{1,2})?$/i;
 
 export function isPrice(text: string): boolean {
   return PRICE_REGEX.test(text.trim());
@@ -145,7 +150,7 @@ export function isPrice(text: string): boolean {
  * Returns the bare price string or null if no flag pattern is found.
  */
 export function tryStripTaxFlag(text: string): string | null {
-  const m = text.trim().match(/^[FNTXBORE](\$?\d{0,3}(?:,\d{3})*\.\d{2})$/i);
+  const m = text.trim().match(/^[FNTXBOREP](\$?\d{0,3}(?:,\d{3})*\.\d{2})$/i);
   return m && isPrice(m[1]) ? m[1] : null;
 }
 
@@ -165,10 +170,6 @@ const DISCOUNT_KEYWORDS = [
 ];
 const DISCOUNT_KEYWORDS_PRICE = [
   '-'
-];
-const TAXED_ITEM_KEYWORDS_PRICE = [
-  'A',
-  'X',
 ];
 
 /**
@@ -191,7 +192,7 @@ const PAYMENT_KEYWORDS = [
  * like "BAND-AID" matching 'aid' or "CHIPS" matching 'chip'.
  */
 const TENDER_KEYWORDS_RE = [
-  /\bcash\b/, /\btendered\b/, /\bamount tendered\b/, /\bchange\b/,
+  /\btender\b/, /\bcash\b/, /\btendered\b/, /\bamount tendered\b/, /\bchange\b/,
   /\btip\b/, /\bgratuity\b/, /\bservice charge\b/,
   /\bapproved\b/, /\bauth code\b/, /\baid\s*:/, /\bchip\b/,
   /\bpaid\b/, /\bpayment\b/, /\bactivation\b/, /\bredemption\b/,
@@ -211,6 +212,9 @@ const COMPETING_TOTAL_KEYWORDS = [
 /**
  * Classify a receipt line by its text content.
  * Check order matters: "subtotal" must be checked before "total".
+ *
+ * @param taxedCodes  Store-specific tax code letters that indicate a taxed item.
+ *                    Defaults to ['A', 'X'] when no store is detected.
  */
 export function classifyLine(text: string, price: string | null): LineType {
   const lower = text.toLowerCase();
@@ -249,7 +253,6 @@ export function classifyLine(text: string, price: string | null): LineType {
   if (/\btare\b/.test(lower)) return 'info';
   if (!price) return 'info';
   if (DISCOUNT_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'discount';
-  if (TAXED_ITEM_KEYWORDS_PRICE.some((k) => price.includes(k))) return 'taxed_item';
   return 'untaxed_item';
 }
 
@@ -289,17 +292,36 @@ export function parsePrice(raw: string | null): number {
 // ── Tax rate line parsing ─────────────────────────────────────────────────────
 
 /**
- * Parse an explicit tax rate breakdown line like "A 8.50% TAX" with price "0.55".
+ * Parse an explicit tax rate breakdown line.
+ * Supports two formats:
+ *   1) "A 8.50% TAX" — letter code before rate (e.g. Albertsons/Sprouts)
+ *   2) "TAX 1 7.900 %" — TAX keyword then numeric code and rate (e.g. Walmart)
  * Returns a TaxRateInfo or null if the line doesn't match.
  */
 export function parseTaxRateLine(text: string, price: string | null): { code: string; rate: number; amount: number } | null {
-  const m = text.match(/\b([A-Z])\s+(\d+(?:\.\d+)?)%\s+TAX\b/i);
-  if (!m || price === null) return null;
-  return {
-    code: m[1].toUpperCase(),
-    rate: parseFloat(m[2]) / 100,
-    amount: parsePrice(price),
-  };
+  if (price === null) return null;
+
+  // Format 1: "A 8.50% TAX"
+  let m = text.match(/\b([A-Z])\s+(\d+(?:\.\d+)?)%\s+TAX\b/i);
+  if (m) {
+    return {
+      code: m[1].toUpperCase(),
+      rate: parseFloat(m[2]) / 100,
+      amount: parsePrice(price),
+    };
+  }
+
+  // Format 2: "TAX 1 7.900 %" or "TAX3 4.350 %" (Walmart-style numeric tax code)
+  m = text.match(/\bTAX\s*(\d+)\s+(\d+(?:\.\d+)?)\s*%/i);
+  if (m) {
+    return {
+      code: m[1],
+      rate: parseFloat(m[2]) / 100,
+      amount: parsePrice(price),
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -308,7 +330,7 @@ export function parseTaxRateLine(text: string, price: string | null): { code: st
  */
 export function extractTaxCode(price: string | null): string | null {
   if (!price) return null;
-  const m = price.trim().match(/[ -]([AXNTOBREF])$/i);
+  const m = price.trim().match(/[ -]([A-Z])$/i);
   return m ? m[1].toUpperCase() : null;
 }
 
@@ -359,6 +381,8 @@ export interface ReceiptItem {
   taxed: boolean;
   /** Tax code letter if detected (e.g. "A", "E"), or null. */
   taxCode: string | null;
+  /** Tax rate for this item's group (decimal, e.g. 0.085), or null if untaxed. */
+  taxRate: number | null;
   /** Raw price string from OCR. */
   rawPrice: string;
   /** Raw discount price string from OCR, if a discount was applied. */
@@ -396,6 +420,8 @@ export interface Receipt {
   lines: ReceiptLine[];
   /** Estimated rotation angle (radians). */
   angle: number;
+  /** Detected store name, or null if unknown. */
+  detectedStore: string | null;
 
   /** Parsed line items with discounts applied. */
   items: ReceiptItem[];
@@ -430,4 +456,12 @@ export interface Receipt {
 
   /** Confidence checks. */
   confidence: ReceiptConfidence;
+}
+
+export interface DebugReceipt extends Receipt {
+  /** All OCR-detected word boxes (for debugging / annotation). */
+  times: {
+    type: string;
+    elapsed: number;
+  }[];
 }

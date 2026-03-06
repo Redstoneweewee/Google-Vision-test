@@ -184,8 +184,8 @@ function checkPerCodeTaxConsistency(ctx: CheckContext): CheckResult[] {
 
   const results: CheckResult[] = [];
   for (const tr of ctx.taxRates) {
-    // Sum items with this tax code
-    const codeItems = ctx.items.filter((i) => i.taxCode === tr.code);
+    // Sum items with this tax code (null tax code maps to "" group)
+    const codeItems = ctx.items.filter((i) => (i.taxCode ?? '') === tr.code);
     const codeBase = codeItems.reduce((s, i) => s + i.finalPrice, 0);
 
     if (codeBase <= 0) {

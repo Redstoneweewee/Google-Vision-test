@@ -55,7 +55,9 @@ import {
   WRAP_MAX_LEFT_ALIGN_FACTOR,
   NEIGHBOR_Y_OVERLAP_MIN,
   NEIGHBOR_MAX_X_GAP_FACTOR,
+  NEIGHBOR_SHORT_GAP_FACTOR,
   NEIGHBOR_MAX_HEIGHT_RATIO,
+  VECTOR_Y_TOLERANCE_FACTOR,
   ORPHAN_SEARCH_RADIUS,
 } from './constants';
 
@@ -124,6 +126,11 @@ function buildTentativeLines(boxes: WordBox[], medH: number): WordBox[][] {
 
   const uf = new UnionFind(n);
 
+  // ── Phase 1: Short-range neighbor connections ──────────────────────────
+  // Use a conservative x-gap to reliably group nearby text words without
+  // accidentally linking distant prices to the wrong line.
+  const shortGap = NEIGHBOR_SHORT_GAP_FACTOR * medH;
+
   for (let i = 0; i < n; i++) {
     const A = boxes[i];
     let bestJ = -1;
@@ -149,7 +156,7 @@ function buildTentativeLines(boxes: WordBox[], medH: number): WordBox[][] {
 
       // X-gap (edge-to-edge, clamped to 0 for overlapping boxes)
       const xGap = Math.max(0, B.left - A.right);
-      if (xGap > NEIGHBOR_MAX_X_GAP_FACTOR * medH) continue;
+      if (xGap > shortGap) continue;
 
       // Pick the closest right neighbor (by center-x distance)
       const xDist = B.center.x - A.center.x;
@@ -164,7 +171,137 @@ function buildTentativeLines(boxes: WordBox[], medH: number): WordBox[][] {
     }
   }
 
-  // Extract connected components
+  // ── Phase 2: Vector-extended connections ───────────────────────────────
+  // For each multi-word group from phase 1, compute its direction vector
+  // and extend rightward to capture distant boxes (e.g. prices) that
+  // align with the line's trajectory.  This is more accurate than raw
+  // y-overlap for long-range connections because it follows the actual
+  // line angle, handling tilted/curved receipts correctly.
+  const longGap = NEIGHBOR_MAX_X_GAP_FACTOR * medH;
+  const vectorTol = VECTOR_Y_TOLERANCE_FACTOR * medH;
+
+  // Snapshot phase-1 roots and build groups
+  const p1Root: number[] = new Array(n);
+  for (let i = 0; i < n; i++) p1Root[i] = uf.find(i);
+
+  const p1Groups = new Map<number, number[]>();
+  for (let i = 0; i < n; i++) {
+    const r = p1Root[i];
+    if (!p1Groups.has(r)) p1Groups.set(r, []);
+    p1Groups.get(r)!.push(i);
+  }
+
+  // Collect merge candidates: for each multi-word line, find distant
+  // boxes whose position aligns with the line's direction vector.
+  interface MergeCandidate {
+    yError: number;
+    lineRightmostIdx: number;
+    targetP1Root: number;
+    targetIdx: number;
+    lineText: string;
+    targetText: string;
+  }
+  const candidates: MergeCandidate[] = [];
+
+  for (const [lineRoot, lineIndices] of p1Groups) {
+    if (lineIndices.length < 2) {
+      // ── Singleton fallback: use y-overlap (like Phase 1) with long gap ──
+      // Singletons (e.g. "TOTAL", "CHANGE") can't compute a direction angle,
+      // so we fall back to simple y-overlap matching within the long gap range.
+      const sIdx = lineIndices[0];
+      const S = boxes[sIdx];
+
+      for (let i = 0; i < n; i++) {
+        if (p1Root[i] === lineRoot) continue;
+        const B = boxes[i];
+        if (B.center.x <= S.center.x) continue;
+
+        const xGap = Math.max(0, B.left - S.right);
+        if (xGap <= shortGap) continue; // Already handled by Phase 1
+        if (xGap > longGap) continue;
+
+        // Height similarity
+        const sMinH = Math.min(S.height, B.height);
+        const sMaxH = Math.max(S.height, B.height);
+        if (sMaxH / sMinH > NEIGHBOR_MAX_HEIGHT_RATIO) continue;
+
+        // Y-overlap check (same criterion as Phase 1)
+        const overlapTop = Math.max(S.top, B.top);
+        const overlapBottom = Math.min(S.bottom, B.bottom);
+        const overlap = Math.max(0, overlapBottom - overlapTop);
+        const minH = Math.min(S.height, B.height);
+        if (minH <= 0 || overlap / minH < NEIGHBOR_Y_OVERLAP_MIN) continue;
+
+        const yError = Math.abs(B.center.y - S.center.y);
+        candidates.push({
+          yError,
+          lineRightmostIdx: sIdx,
+          targetP1Root: p1Root[i],
+          targetIdx: i,
+          lineText: S.text,
+          targetText: B.text,
+        });
+      }
+      continue;
+    }
+
+    const lineBoxes = lineIndices.map(i => boxes[i]);
+    const angle = computeLineAngle(lineBoxes);
+
+    // Find rightmost box in this line
+    let rIdx = lineIndices[0];
+    for (const idx of lineIndices) {
+      if (boxes[idx].right > boxes[rIdx].right) rIdx = idx;
+    }
+    const R = boxes[rIdx];
+
+    for (let i = 0; i < n; i++) {
+      if (p1Root[i] === lineRoot) continue;
+
+      const B = boxes[i];
+      if (B.center.x <= R.center.x) continue; // Must be to the right
+
+      const xGap = Math.max(0, B.left - R.right);
+      if (xGap > longGap) continue;
+
+      // Height similarity
+      const bMinH = Math.min(B.height, R.height);
+      const bMaxH = Math.max(B.height, R.height);
+      if (bMaxH / bMinH > NEIGHBOR_MAX_HEIGHT_RATIO) continue;
+
+      // Vector projection: predict expected y at B's x position
+      const dx = B.center.x - R.center.x;
+      const expectedY = R.center.y + dx * Math.tan(angle);
+      const yError = Math.abs(B.center.y - expectedY);
+
+      candidates.push({
+        yError,
+        lineRightmostIdx: rIdx,
+        targetP1Root: p1Root[i],
+        targetIdx: i,
+        lineText: lineBoxes.map(b => b.text).join(' '),
+        targetText: boxes[i].text,
+      });
+    }
+  }
+
+  // Sort by y-error (best first) and apply greedily.
+  // The claimed set prevents a target group from being absorbed by
+  // multiple source lines — first (best) match wins.
+  candidates.sort((a, b) => a.yError - b.yError);
+  const claimed = new Set<number>();
+
+  for (const c of candidates) {
+    if (c.yError > vectorTol) break;
+    if (claimed.has(c.targetP1Root)) continue;
+    if (uf.find(c.targetIdx) === uf.find(c.lineRightmostIdx)) continue;
+
+    console.debug(`[DEBUG]    Phase 2 vector link: "${c.lineText}" → "${c.targetText}" (yErr=${c.yError.toFixed(1)})`);
+    claimed.add(c.targetP1Root);
+    uf.union(c.lineRightmostIdx, c.targetIdx);
+  }
+
+  // Extract final connected components
   const groups = new Map<number, number[]>();
   for (let i = 0; i < n; i++) {
     const root = uf.find(i);
@@ -510,7 +647,7 @@ function assignPrice(
     // or dash+flag combos like "-A".
     for (let j = i + 1; j < ordered.length && j <= i + 2; j++) {
       const suf = ordered[j].text.trim();
-      if (!/^(-|[AXNTOBREF]|-[AXNTOBREF])$/i.test(suf)) break;
+      if (!/^(-|[A-Z]|-[A-Z])$/i.test(suf)) break;
 
       // Try joining: direct concat, space, dash — pick first valid match
       const upper = suf.toUpperCase();
