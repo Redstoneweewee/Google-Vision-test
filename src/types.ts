@@ -13,6 +13,12 @@ export interface Point {
   y: number;
 }
 
+/** A paragraph-level OCR word with text and center position. */
+export interface Word {
+  t: string;
+  c: { x: number; y: number };
+}
+
 /**
  * Axis-aligned summary of a single OCR word box, plus a back-reference
  * to the original Vision API annotation (needed for bounding-box drawing).

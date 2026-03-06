@@ -23,7 +23,7 @@ import sharp from 'sharp';
 import fs from 'fs';
 import path from 'path';
 
-import type { DebugReceipt, Word } from './types';
+import type { DebugReceipt } from './types';
 import { MAX_IMAGE_DIMENSION } from './constants';
 import { reconstructLines } from './algorithm';
 import { buildLlamaInput, processReceiptWithLlama } from './llama-pipeline';
@@ -40,7 +40,7 @@ const client = new vision.ImageAnnotatorClient({
  *
  * Returns the same DebugReceipt shape as detectTextLocal in detect.ts.
  */
-export async function detectText(filePath: string) {
+export async function detectTextLocalLlama(filePath: string): Promise<DebugReceipt> {
   const start = Date.now();
   const resolvedPath = path.resolve(filePath);
 
@@ -63,32 +63,54 @@ export async function detectText(filePath: string) {
   // ── Google Cloud Vision OCR ─────────────────────────────────────────
   const [result] = await client.documentTextDetection({ image: { content: imageBuffer } });
 
+  const end2 = Date.now();
+
   const detections = result.textAnnotations;
   if (!detections || detections.length === 0) {
     throw new Error('No text detected in image.');
   }
-  // Split fullTextAnnotation.text by \n — each line maps to a paragraph
-  const words: Word[] = [];
 
-  for (const page of result.fullTextAnnotation?.pages ?? []) {
-    for (const block of page.blocks ?? []) {
-      for (const paragraph of block.paragraphs ?? []) {
-        const text = (paragraph.words ?? [])
-          .map((w) => (w.symbols ?? []).map((s) => s.text).join(''))
-          .join(' ');
+  console.log(`Full text: ${result.fullTextAnnotation?.text}\n\n`);
 
-        const verts = paragraph.boundingBox?.vertices ?? [];
-        const cx = verts.reduce((s, v) => s + (v.x ?? 0), 0) / (verts.length || 1);
-        const cy = verts.reduce((s, v) => s + (v.y ?? 0), 0) / (verts.length || 1);
+  // ── Algorithmic line reconstruction (reuse existing pipeline) ───────
+  const { lines: receiptLines, angle } = reconstructLines(detections.slice(1));
 
-        words.push({ t: text, c: { x: cx, y: cy } });
-      }
-    }
-  }
+  const end3 = Date.now();
 
-  console.log(`Words:\n${JSON.stringify(words)}\n\n`);
+  // ── Build minimal input for Llama (items/discounts only) ───────────
+  const llamaInput = buildLlamaInput(receiptLines);
+
+  const lineCount = llamaInput.split('\n').length;
+  console.log(`Sending ${llamaInput} to Llama 3.2...\n`);
+
+  // ── Llama 3.2 post-processing ─────────────────────────────────────
+  const { receipt, llamaElapsed } = await processReceiptWithLlama(
+    llamaInput,
+    receiptLines,
+    angle,
+  );
+
+  const end4 = Date.now();
+
+  //console.log(`receipt:`, receipt);
+
+  return {
+    ...receipt,
+    times: [
+      { type: 'Image loaded and resized time', elapsed: end1 - start },
+      { type: 'OCR Text detection time', elapsed: end2 - end1 },
+      { type: 'Algorithmic line reconstruction time', elapsed: end3 - end2 },
+      { type: 'Llama 3.2 post-processing time', elapsed: llamaElapsed },
+    ],
+  };
 }
 
-
-const filePath = process.argv[2] ?? './sample.jpg';
-detectText(filePath);
+// ── Entry point ───────────────────────────────────────────────────────────────
+(async () => {
+  const filePath = process.argv[2] ?? './sample.jpg';
+  const receipt = await detectTextLocalLlama(filePath);
+  printReceipt(receipt);
+})().catch((err: Error) => {
+  console.error('Error:', err.message ?? err);
+  process.exit(1);
+});
