@@ -3,3 +3,7 @@ dist/
 .env
 service-account-key.json
 *.key.json
+
+tests/
+new_tests/
+test_results*
