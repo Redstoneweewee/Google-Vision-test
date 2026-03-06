@@ -10,7 +10,7 @@
  * rate and determines which group of items is most likely taxed.
  */
 
-import type { ReceiptItem, TaxRateInfo } from './utils';
+import type { ReceiptItem, TaxRateInfo } from './types';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 

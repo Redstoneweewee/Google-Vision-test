@@ -16,21 +16,7 @@ import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 
-// ── Colour helpers (same ANSI codes used elsewhere in the project) ───────────
-const RESET  = '\x1b[0m';
-const BOLD   = '\x1b[1m';
-const DIM    = '\x1b[2m';
-const RED    = '\x1b[31m';
-const GREEN  = '\x1b[32m';
-const YELLOW = '\x1b[33m';
-const CYAN   = '\x1b[36m';
-
-const colorBold  = (s: string) => `${BOLD}${s}${RESET}`;
-const colorPass  = (s: string) => `${GREEN}${s}${RESET}`;
-const colorWarn  = (s: string) => `${YELLOW}${s}${RESET}`;
-const colorError = (s: string) => `${RED}${s}${RESET}`;
-const colorDim   = (s: string) => `${DIM}${s}${RESET}`;
-const colorCyan  = (s: string) => `${CYAN}${s}${RESET}`;
+import { colorBold, colorPass, colorWarn, colorError, colorDim, colorCyan } from './colors';
 
 // ── Image discovery ──────────────────────────────────────────────────────────
 
@@ -53,24 +39,6 @@ function discoverImages(dir: string): string[] {
   return results.sort();
 }
 
-// ── Capture stdout ───────────────────────────────────────────────────────────
-
-/** Run `fn` and capture everything it writes to process.stdout. */
-async function captureStdout(fn: () => Promise<void>): Promise<string> {
-  const chunks: string[] = [];
-  const origWrite = process.stdout.write.bind(process.stdout);
-  process.stdout.write = ((chunk: any, ...args: any[]) => {
-    chunks.push(typeof chunk === 'string' ? chunk : chunk.toString());
-    return true;
-  }) as any;
-
-  try {
-    await fn();
-  } finally {
-    process.stdout.write = origWrite;
-  }
-  return chunks.join('');
-}
 
 // ── Strip ANSI escape codes (for the plain-text output file) ─────────────────
 

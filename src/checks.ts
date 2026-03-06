@@ -6,30 +6,13 @@
  * user-friendly summary string is produced with colored output.
  */
 
-import type { CheckResult, ReceiptConfidence, Severity, TaxRateInfo, ReceiptItem } from './utils';
+import type { CheckResult, ReceiptConfidence, Severity, TaxRateInfo, ReceiptItem } from './types';
+import {
+  RESET, BOLD, GREEN, YELLOW, RED, BG_GREEN, BG_YELLOW, BG_RED,
+  colorPass, colorWarn, colorError, colorBold, colorDim, colorCyan,
+} from './colors';
 
-// ── ANSI color helpers ───────────────────────────────────────────────────────
-
-const RESET  = '\x1b[0m';
-const BOLD   = '\x1b[1m';
-const DIM    = '\x1b[2m';
-
-const GREEN  = '\x1b[32m';
-const YELLOW = '\x1b[33m';
-const RED    = '\x1b[31m';
-const CYAN   = '\x1b[36m';
-const WHITE  = '\x1b[37m';
-
-const BG_GREEN  = '\x1b[42m';
-const BG_YELLOW = '\x1b[43m';
-const BG_RED    = '\x1b[41m';
-
-export function colorPass(text: string): string   { return `${GREEN}${text}${RESET}`; }
-export function colorWarn(text: string): string   { return `${YELLOW}${text}${RESET}`; }
-export function colorError(text: string): string  { return `${RED}${text}${RESET}`; }
-export function colorBold(text: string): string   { return `${BOLD}${text}${RESET}`; }
-export function colorDim(text: string): string    { return `${DIM}${text}${RESET}`; }
-export function colorCyan(text: string): string   { return `${CYAN}${text}${RESET}`; }
+export { colorPass, colorWarn, colorError, colorBold, colorDim, colorCyan };
 
 function colorBySeverity(sev: Severity, text: string): string {
   switch (sev) {

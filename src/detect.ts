@@ -6,126 +6,21 @@ import fs from 'fs';
 import path from 'path';
 
 import { reconstructLines } from './algorithm';
-import type { ReconstructionResult } from './algorithm';
-import type { ReceiptLine, Point, Receipt, ReceiptItem, ReceiptConfidence, LineType, WordBox, TaxRateInfo, DebugReceipt } from './utils';
-import { rotatePoint, parsePrice, parseTaxRateLine, extractTaxCode } from './utils';
-import { checkConfidence, formatConfidenceReport, colorBold, colorDim, colorPass, colorWarn, colorError, colorCyan } from './checks';
+import type { ReceiptLine, ReceiptItem, TaxRateInfo, DebugReceipt } from './types';
+import { parsePrice, parseTaxRateLine, extractTaxCode } from './utils';
+import { checkConfidence, formatConfidenceReport } from './checks';
 import { MAX_IMAGE_DIMENSION } from './constants';
 import { determineTaxGroups } from './stores';
 import type { TaxGroupResult } from './stores';
+import { LineAnnotation, buildLinePolygon, formatLineLabel, saveAnnotatedImage } from './annotation';
+import { printReceipt } from './printing';
 
 type TextAnnotation = protos.google.cloud.vision.v1.IEntityAnnotation;
-type Vertex = protos.google.cloud.vision.v1.IVertex;
 
 // Creates a client using an API key from the GOOGLE_API_KEY environment variable.
 const client = new vision.ImageAnnotatorClient({
   apiKey: process.env.GOOGLE_API_KEY,
 });
-
-interface LineAnnotation {
-  description: string;
-  lineType: LineType;
-  boundingPoly: { vertices: Required<Vertex>[] };
-}
-
-/**
- * Builds a polygon for a line by tracing the bounding boxes of each word:
- *   - Top edges from left to right (TL → TR for each word)
- *   - Bottom edges from right to left (BR → BL for each word)
- *
- * This produces a tight outline that follows each word's actual OCR box
- * rather than a single merged rectangle.
- */
-function buildLinePolygon(
-  words: WordBox[],
-): LineAnnotation['boundingPoly'] {
-  if (words.length === 0) {
-    const zero = { x: 0, y: 0 } as Required<Vertex>;
-    return { vertices: [zero, zero, zero, zero] };
-  }
-
-  // Sort words left to right
-  const sorted = [...words].sort((a, b) => a.left - b.left);
-
-  const topPath: Required<Vertex>[] = [];
-  const bottomReversed: Required<Vertex>[] = [];
-
-  for (const word of sorted) {
-    const verts = (word.original.boundingPoly?.vertices ?? []).map((v) => ({
-      x: v.x ?? 0,
-      y: v.y ?? 0,
-    })) as Required<Vertex>[];
-
-    if (verts.length >= 4) {
-      // Vertices: [TL(0), TR(1), BR(2), BL(3)]
-      topPath.push(verts[0], verts[1]);
-      bottomReversed.push(verts[3], verts[2]);
-    }
-  }
-
-  // Reverse the bottom path so it goes right → left
-  bottomReversed.reverse();
-
-  return { vertices: [...topPath, ...bottomReversed] };
-}
-
-/**
- * Produce a short label for the annotated-image overlay.
- */
-function formatLineLabel(line: ReceiptLine): string {
-  if (line.lineType === 'wrapped') return `\u21a9 ${line.text}`;
-  if (line.price) {
-    if (line.lineType === 'untaxed_item' || line.lineType === 'taxed_item')
-      return `${line.itemName ?? ''} \u2192 ${line.price}`;
-    return `[${line.lineType.toUpperCase()}] ${line.itemName ?? ''} ${line.price}`;
-  }
-  return line.text;
-}
-
-/**
- * Draws per-line bounding boxes and labels onto the image and saves it.
- */
-async function saveAnnotatedImage(
-  inputPath: string,
-  imageBuffer: Buffer,
-  lineAnnotations: LineAnnotation[]
-): Promise<void> {
-  const meta = await sharp(imageBuffer).metadata();
-  const { width, height } = meta;
-
-  const polygons = lineAnnotations
-    .map(({ description, lineType, boundingPoly: { vertices } }) => {
-      const pts = vertices.map((v) => `${v.x},${v.y}`).join(' ');
-      const lx = vertices[0].x ?? 0;
-      const ly = vertices[0].y ?? 0;
-      const label = description
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-      const color = (lineType === 'info' || lineType === 'tender') ? '#888888' : '#00FF00';
-      return `
-      <polygon points="${pts}"
-        fill="none" stroke="${color}" stroke-width="2"/>`;
-    })
-    .join('\n');
-
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg"
-    width="${width}" height="${height}">
-    ${polygons}
-  </svg>`;
-
-  const ext = path.extname(inputPath);
-  const base = path.basename(inputPath, ext);
-  const dir = path.dirname(inputPath);
-  const outPath = path.join(dir, `${base}_annotated${ext}`);
-
-  await sharp(imageBuffer)
-    .composite([{ input: Buffer.from(svg), top: 0, left: 0 }])
-    .toFile(outPath);
-
-  console.log(`\nAnnotated image saved to: ${outPath}`);
-}
 
 /**
  * Build the list of ReceiptItems from classified lines.
@@ -386,100 +281,6 @@ export async function detectTextLocal(filePath: string): Promise<DebugReceipt> {
       { type: 'Save annotation time', elapsed: end4-end3 }
     ]
   };
-}
-
-// ── Pretty-print helper ──────────────────────────────────────────────────────
-
-function printReceipt(receipt: DebugReceipt): void {
-  // Build rate lookup from items for line-level display
-  const codeToRate = new Map<string, number | null>();
-  for (const item of receipt.items) {
-    const code = item.taxCode ?? '';
-    if (!codeToRate.has(code)) {
-      codeToRate.set(code, item.taxRate);
-    }
-  }
-
-  console.log(`\n${colorBold('=== Parsed Receipt ===')}`);
-  for (const line of receipt.lines) {
-    if (line.lineType === 'wrapped') continue;
-    let tag: string;
-    if (line.lineType === 'taxed_item' || line.lineType === 'untaxed_item') {
-      const code = extractTaxCode(line.price) ?? '';
-      const label = code || '(none)';
-      const rate = codeToRate.get(code);
-      tag = rate !== null && rate !== undefined
-        ? `[${label} @ ${(rate * 100).toFixed(2)}%]`
-        : `[${label} UNTAXED]`;
-    } else {
-      tag = `[${line.lineType.toUpperCase()}]`;
-    }
-    tag = tag.padEnd(16);
-    const name = (line.itemName ?? line.text).padEnd(35);
-    const price = line.price ?? '';
-    const lineColor =
-      line.lineType === 'subtotal' || line.lineType === 'tax' || line.lineType === 'total'
-        ? colorCyan
-        : line.lineType === 'discount'
-          ? colorWarn
-          : line.lineType === 'untaxed_item'
-            ? colorDim
-            : line.lineType === 'tender'
-              ? colorDim
-              : (s: string) => s;
-    console.log(`  ${lineColor(tag)} ${name} ${price}`);
-  }
-
-  console.log(`\n${colorBold('=== Items (with discounts applied) ===')}`);
-  for (const item of receipt.items) {
-    const disc = item.discount !== 0 ? colorWarn(`  disc: ${item.discount.toFixed(2)}`) : '';
-    const rateLabel = item.taxRate !== null
-      ? colorDim(` [${item.taxCode ?? '?'} @ ${(item.taxRate * 100).toFixed(2)}%]`)
-      : (item.taxCode ? colorDim(` [${item.taxCode} untaxed]`) : '');
-    console.log(`  ${item.name.padEnd(35)} ${item.finalPrice.toFixed(2)}${disc}${rateLabel}`);
-  }
-
-  console.log(`\n${colorBold('=== Summary ===')}`);
-  console.log(`  Total lines:          ${receipt.totalLines}`);
-  console.log(`  Total items:          ${receipt.totalItems}`);
-
-  // Per-group breakdown
-  const groupMap = new Map<string, { items: typeof receipt.items, rate: number | null }>();
-  for (const item of receipt.items) {
-    const key = item.taxCode ?? '';
-    if (!groupMap.has(key)) groupMap.set(key, { items: [], rate: item.taxRate });
-    groupMap.get(key)!.items.push(item);
-  }
-  console.log(`  Tax groups:`);
-  for (const [code, group] of groupMap) {
-    const label = code || '(no suffix)';
-    const total = group.items.reduce((s, i) => s + i.finalPrice, 0);
-    const rateStr = group.rate !== null
-      ? `${(group.rate * 100).toFixed(2)}%`
-      : 'untaxed';
-    console.log(`    ${label} (${rateStr}): ${group.items.length} items, $${total.toFixed(2)}`);
-  }
-
-  console.log(`  Calculated subtotal:  $${receipt.calculatedSubtotal.toFixed(2)}`);
-  console.log(`  OCR subtotal:         $${receipt.ocrSubtotal?.toFixed(2) ?? colorDim('(not found)')}`);
-  console.log(`  OCR tax:              $${receipt.ocrTax?.toFixed(2) ?? colorDim('(not found)')}`);
-  console.log(`  OCR total:            $${receipt.ocrTotal?.toFixed(2) ?? colorDim('(not found)')}`);
-  console.log(`  Tax rate:             ${receipt.taxRate !== null ? (receipt.taxRate * 100).toFixed(2) + '%' : colorDim('(not computable)')}`);
-  if (receipt.taxRates.length > 0) {
-    console.log(`  Tax rate breakdown:`);
-    for (const tr of receipt.taxRates) {
-      console.log(`    Code ${tr.code}: ${(tr.rate * 100).toFixed(2)}% = $${tr.amount.toFixed(2)}`);
-    }
-  }
-  console.log(`  Tender amount:        $${receipt.tenderAmount?.toFixed(2) ?? colorDim('(not found)')}`);
-  
-  for( const timeInfo of receipt.times) {
-    console.log(`  ${timeInfo.type}: ${(timeInfo.elapsed / 1000).toFixed(2)}s`);
-  }
-  console.log(`total processing time: ${((receipt.times.reduce((s, t) => s + t.elapsed, 0)) / 1000).toFixed(2)}s`);
-
-  // ── Colored confidence report with suggestions ──────────────────────────
-  console.log(formatConfidenceReport(receipt.confidence));
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
