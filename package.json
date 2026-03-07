@@ -5,9 +5,13 @@
   "main": "dist/detect.js",
   "scripts": {
     "start": "npx ts-node src/detect.ts",
+    "start:llama": "npx ts-node src/detect-llama.ts",
     "test": "npx ts-node src/run-tests.ts",
+    "test:llama": "npx ts-node src/run-tests-llama.ts",
     "detect:local": "npx ts-node src/detect.ts local",
     "detect:remote": "npx ts-node src/detect.ts remote",
+    "detect:llama": "npx ts-node src/detect-llama.ts",
+    "detect:ocr": "npx ts-node src/ocr-output.ts",
     "build": "npx tsc",
     "start:build": "node dist/detect.js"
   },
