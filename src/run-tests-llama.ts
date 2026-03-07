@@ -50,6 +50,10 @@ interface TestResult {
   file: string;
   store: string;
   score: number;
+  items: number | null;
+  tax: string | null;
+  total: string | null;
+  llamaMatch: string | null;
   output: string;
   error?: string;
 }
@@ -77,18 +81,17 @@ interface TestResult {
   const projectRoot = path.resolve(__dirname, '..');
   const detectScript = path.join(__dirname, 'detect-llama.ts');
 
-  console.log(colorBold(`\nRunning ${images.length} receipt test(s) from ${rootDir} [LLAMA PIPELINE]\n`));
+  const CONCURRENCY = parseInt(process.env.PARALLEL ?? '4', 10) || 4;
+  console.log(colorBold(`\nRunning ${images.length} receipt test(s) from ${rootDir} [LLAMA PIPELINE]  (concurrency=${CONCURRENCY})\n`));
 
-  const results: TestResult[] = [];
+  const results: TestResult[] = new Array(images.length);
+  let completed = 0;
   const totalStart = Date.now();
 
-  for (let i = 0; i < images.length; i++) {
+  async function runOne(i: number): Promise<void> {
     const absPath = images[i];
     const relPath = path.relative(projectRoot, absPath).replace(/\\/g, '/');
     const store = path.basename(path.dirname(absPath));
-
-    const label = `[${i + 1}/${images.length}]`.padEnd(8);
-    process.stdout.write(`${colorDim(label)} ${relPath} … `);
 
     const start = Date.now();
     let result: TestResult;
@@ -111,13 +114,24 @@ interface TestResult {
       const m = clean.match(/Score:\s*(\d+)%/);
       const score = m ? parseInt(m[1], 10) : -1;
 
-      result = { file: relPath, store, score, output: combined };
+      const mItems = clean.match(/Total items:\s*(\d+)/);
+      const items = mItems ? parseInt(mItems[1], 10) : null;
+      const mTax = clean.match(/OCR tax:\s*\$(\S+)/);
+      const tax = mTax && mTax[1] !== '(not' ? mTax[1] : null;
+      const mTotal = clean.match(/OCR total:\s*\$(\S+)/);
+      const total = mTotal && mTotal[1] !== '(not' ? mTotal[1] : null;
+
+      const mLlama = clean.match(/Llama names:\s*(\d+\/\d+)\s*(OK|MISMATCH)/);
+      const llamaMatch = mLlama ? `${mLlama[1]} ${mLlama[2]}` : null;
+
+      result = { file: relPath, store, score, items, tax, total, llamaMatch, output: combined };
     } catch (err: any) {
       const msg = err.stderr || err.stdout || err.message || String(err);
-      result = { file: relPath, store, score: -1, output: msg, error: msg };
+      result = { file: relPath, store, score: -1, items: null, tax: null, total: null, llamaMatch: null, output: msg, error: msg };
     }
 
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    completed++;
 
     const scoreStr =
       result.score === -1
@@ -127,10 +141,21 @@ interface TestResult {
           : result.score >= 85
             ? colorWarn(`${result.score}%`)
             : colorError(`${result.score}%`);
-    console.log(`${scoreStr}  ${colorDim(`(${elapsed}s)`)}`);
+    const label = `[${completed}/${images.length}]`.padEnd(8);
+    console.log(`${colorDim(label)} ${relPath} … ${scoreStr}  ${colorDim(`(${elapsed}s)`)}`);
 
-    results.push(result);
+    results[i] = result;
   }
+
+  // ── Parallel worker pool ────────────────────────────────────────────────
+  const queue = images.map((_, i) => i);
+  async function worker(): Promise<void> {
+    while (queue.length > 0) {
+      const idx = queue.shift()!;
+      await runOne(idx);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, images.length) }, () => worker()));
 
   const totalElapsed = ((Date.now() - totalStart) / 1000).toFixed(1);
 
@@ -144,9 +169,13 @@ interface TestResult {
 
   const COL_FILE = 45;
   const COL_SCORE = 8;
-  const headerLine = `  ${'File'.padEnd(COL_FILE)} ${'Score'.padStart(COL_SCORE)}`;
+  const COL_ITEMS = 7;
+  const COL_TAX = 10;
+  const COL_TOTAL = 10;
+  const COL_LLAMA = 14;
+  const headerLine = `  ${'File'.padEnd(COL_FILE)} ${'Score'.padStart(COL_SCORE)} ${'Items'.padStart(COL_ITEMS)} ${'Tax'.padStart(COL_TAX)} ${'Total'.padStart(COL_TOTAL)} ${'Llama'.padStart(COL_LLAMA)}`;
   console.log(colorDim(headerLine));
-  console.log(colorDim(`  ${'─'.repeat(COL_FILE)} ${'─'.repeat(COL_SCORE)}`));
+  console.log(colorDim(`  ${'─'.repeat(COL_FILE)} ${'─'.repeat(COL_SCORE)} ${'─'.repeat(COL_ITEMS)} ${'─'.repeat(COL_TAX)} ${'─'.repeat(COL_TOTAL)} ${'─'.repeat(COL_LLAMA)}`));
 
   let totalPassed = 0;
   const totalTests = results.length;
@@ -167,22 +196,41 @@ interface TestResult {
       } else {
         scoreCell = colorError(`${r.score}%`.padStart(COL_SCORE));
       }
-      console.log(`  ${name} ${scoreCell}`);
+      const itemsCell = (r.items !== null ? String(r.items) : '-').padStart(COL_ITEMS);
+      const taxCell = (r.tax !== null ? `$${r.tax}` : '-').padStart(COL_TAX);
+      const totalCell = (r.total !== null ? `$${r.total}` : '-').padStart(COL_TOTAL);
+      const llamaRaw = r.llamaMatch ?? '-';
+      const llamaCell = llamaRaw.includes('MISMATCH')
+        ? colorError(llamaRaw.padStart(COL_LLAMA))
+        : llamaRaw.includes('OK')
+          ? colorPass(llamaRaw.padStart(COL_LLAMA))
+          : colorDim(llamaRaw.padStart(COL_LLAMA));
+      console.log(`  ${name} ${scoreCell} ${colorDim(itemsCell)} ${colorDim(taxCell)} ${colorDim(totalCell)} ${llamaCell}`);
     }
   }
 
-  console.log(colorDim(`\n  ${'─'.repeat(COL_FILE + COL_SCORE + 1)}`));
+  console.log(colorDim(`\n  ${'\u2500'.repeat(COL_FILE + COL_SCORE + COL_ITEMS + COL_TAX + COL_TOTAL + COL_LLAMA + 5)}`));
 
   const pctPassed = totalTests > 0 ? ((totalPassed / totalTests) * 100).toFixed(0) : '0';
+  const llamaOkCount = results.filter((r) => r.llamaMatch?.includes('OK')).length;
+  const llamaMismatchCount = results.filter((r) => r.llamaMatch?.includes('MISMATCH')).length;
   const summaryColor = totalPassed === totalTests ? colorPass : totalPassed > totalTests * 0.8 ? colorWarn : colorError;
+  const llamaSummaryColor = llamaMismatchCount === 0 ? colorPass : colorError;
   console.log(
-    `  ${colorBold('Total:')} ${summaryColor(`${totalPassed}/${totalTests} at 100%`)}  (${pctPassed}%)   ${colorDim(`${totalElapsed}s`)}`,
+    `  ${colorBold('Total:')} ${summaryColor(`${totalPassed}/${totalTests} at 100%`)}  (${pctPassed}%)   ${llamaSummaryColor(`Llama: ${llamaOkCount}/${llamaOkCount + llamaMismatchCount} OK`)}   ${colorDim(`${totalElapsed}s`)}`,
   );
   console.log();
 
   // ── Write full output file ─────────────────────────────────────────────
 
-  const outPath = path.join(projectRoot, `test_results_llama.txt`);
+  const iterationStr = fs.readFileSync(path.join(projectRoot, `iteration.txt`), 'utf-8'); // ensure __dirname is correct even if run with ts-node from another folder
+  let iteration = parseInt(iterationStr, 10) || 0;
+  while (fs.existsSync(path.join(projectRoot, `test_results_${iteration}_llama.txt`)) || fs.existsSync(path.join(projectRoot, `test_results_${iteration}.txt`))) {
+    iteration++;
+  }
+  const outPath = path.join(projectRoot, `test_results_${iteration}_llama.txt`);
+  iteration++; // increment for next run
+  fs.writeFileSync(path.join(projectRoot, `iteration.txt`), String(iteration), 'utf-8'); // save iteration for next run
   const lines: string[] = [];
 
   lines.push('='.repeat(80));
@@ -192,19 +240,23 @@ interface TestResult {
 
   lines.push('SCORE SUMMARY');
   lines.push('-'.repeat(60));
-  lines.push(`  ${'File'.padEnd(COL_FILE)} ${'Score'.padStart(COL_SCORE)}`);
-  lines.push(`  ${'─'.repeat(COL_FILE)} ${'─'.repeat(COL_SCORE)}`);
+  lines.push(`  ${'File'.padEnd(COL_FILE)} ${'Score'.padStart(COL_SCORE)} ${'Items'.padStart(COL_ITEMS)} ${'Tax'.padStart(COL_TAX)} ${'Total'.padStart(COL_TOTAL)} ${'Llama'.padStart(COL_LLAMA)}`);
+  lines.push(`  ${'─'.repeat(COL_FILE)} ${'─'.repeat(COL_SCORE)} ${'─'.repeat(COL_ITEMS)} ${'─'.repeat(COL_TAX)} ${'─'.repeat(COL_TOTAL)} ${'─'.repeat(COL_LLAMA)}`);
   for (const store of stores) {
     const storeResults = results.filter((r) => r.store === store);
     lines.push('');
     lines.push(`  ${store.toUpperCase()}`);
     for (const r of storeResults) {
       const scoreText = r.score === -1 ? 'ERR' : `${r.score}%`;
-      lines.push(`  ${r.file.padEnd(COL_FILE)} ${scoreText.padStart(COL_SCORE)}`);
+      const itemsText = r.items !== null ? String(r.items) : '-';
+      const taxText = r.tax !== null ? `$${r.tax}` : '-';
+      const totalText = r.total !== null ? `$${r.total}` : '-';
+      const llamaText = r.llamaMatch ?? '-';
+      lines.push(`  ${r.file.padEnd(COL_FILE)} ${scoreText.padStart(COL_SCORE)} ${itemsText.padStart(COL_ITEMS)} ${taxText.padStart(COL_TAX)} ${totalText.padStart(COL_TOTAL)} ${llamaText.padStart(COL_LLAMA)}`);
     }
   }
   lines.push('');
-  lines.push(`  Total: ${totalPassed}/${totalTests} at 100%  (${pctPassed}%)`);
+  lines.push(`  Total: ${totalPassed}/${totalTests} at 100%  (${pctPassed}%)   Llama: ${llamaOkCount}/${llamaOkCount + llamaMismatchCount} OK`);
   lines.push(`  Elapsed: ${totalElapsed}s`);
   lines.push('');
   lines.push('');

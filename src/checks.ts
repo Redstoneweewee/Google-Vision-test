@@ -128,14 +128,25 @@ function checkCalcSubtotalVsTotalMinusTax(ctx: CheckContext): CheckResult | null
   const delta = Math.abs(calculatedSubtotal - reference);
   const ok = delta < CENTS_TOLERANCE;
   const direction = calculatedSubtotal < reference ? 'less' : 'more';
+
+  // When there's no explicit tax line and subtotal < total, the gap is
+  // likely tax.  If the implied rate is plausible (0–15%), don't penalize.
+  let penalty = ok ? 0 : 8 + delta * 80;
+  if (!ok && ocrTax === null && calculatedSubtotal > 0 && calculatedSubtotal < ocrTotal) {
+    const impliedRate = (ocrTotal - calculatedSubtotal) / calculatedSubtotal;
+    if (impliedRate > 0 && impliedRate <= 0.15) {
+      penalty = 0;
+    }
+  }
+
   return {
     id: 'calc_subtotal_vs_total_minus_tax',
-    severity: ok ? 'info' : (delta > 5 ? 'error' : 'warn'),
+    severity: ok ? 'info' : (penalty === 0 ? 'info' : delta > 5 ? 'error' : 'warn'),
     message: ok
       ? `Calculated subtotal ($${calculatedSubtotal.toFixed(2)}) matches ${label}`
       : `Calculated subtotal ($${calculatedSubtotal.toFixed(2)}) is $${delta.toFixed(2)} ${direction} than ${label} — we may have ${direction === 'less' ? 'missed items' : 'extra items'}`,
     delta,
-    penalty: ok ? 0 : 8 + delta * 80,
+    penalty,
   };
 }
 
@@ -288,7 +299,10 @@ function checkMissingSummaryLines(ctx: CheckContext): CheckResult[] {
     // calculated subtotal already matches the total (tax is zero or
     // included in prices, e.g. VAT-inclusive receipts).
     const irrelevant = ctx.taxedItemsValue <= 0 ||
-      (ctx.ocrTotal !== null && Math.abs(ctx.calculatedSubtotal - ctx.ocrTotal) < CENTS_TOLERANCE);
+      (ctx.ocrTotal !== null && Math.abs(ctx.calculatedSubtotal - ctx.ocrTotal) < CENTS_TOLERANCE) ||
+      // No explicit tax line but the subtotal→total gap is a plausible tax rate
+      (ctx.ocrTotal !== null && ctx.calculatedSubtotal > 0 && ctx.calculatedSubtotal < ctx.ocrTotal &&
+        (ctx.ocrTotal - ctx.calculatedSubtotal) / ctx.calculatedSubtotal <= 0.15);
     results.push({
       id: 'missing_tax',
       severity: 'info',
@@ -341,7 +355,10 @@ function computeOverallScore(checks: CheckResult[], ctx: CheckContext): number {
   const subtotalCoverable = ctx.ocrSubtotal === null && ctx.ocrTotal !== null;
   const taxIrrelevant = ctx.ocrTax === null && (
     ctx.taxedItemsValue <= 0 ||
-    (ctx.ocrTotal !== null && Math.abs(ctx.calculatedSubtotal - ctx.ocrTotal) < CENTS_TOLERANCE)
+    (ctx.ocrTotal !== null && Math.abs(ctx.calculatedSubtotal - ctx.ocrTotal) < CENTS_TOLERANCE) ||
+    // No explicit tax line but the subtotal→total gap is a plausible tax rate
+    (ctx.ocrTotal !== null && ctx.calculatedSubtotal > 0 && ctx.calculatedSubtotal < ctx.ocrTotal &&
+      (ctx.ocrTotal - ctx.calculatedSubtotal) / ctx.calculatedSubtotal <= 0.15)
   );
   const missingCount =
     (ctx.ocrSubtotal === null && !subtotalCoverable ? 1 : 0) +

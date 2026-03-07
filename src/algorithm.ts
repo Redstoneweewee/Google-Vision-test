@@ -43,6 +43,9 @@ import {
   handleWrappedNames,
   mergeOrphanItemPrices,
   mergeOrphanPrices,
+  reconstructBrokenTaxPrices,
+  extractBarcodePrices,
+  rescueBarcodeItems,
 } from './edge-cases';
 
 import {
@@ -645,7 +648,23 @@ function assignPrice(
     // differences don't shift the comparison — the physical right column
     // on the receipt is consistent in image space.
     if (priceColX !== null) {
-      if (Math.abs(ordered[i].right - priceColX) > PRICE_COLUMN_TOLERANCE_FACTOR * medH) continue;
+      // When OCR splits "$" and the number into separate words (e.g. "$" + "376.31"),
+      // the number word extends further right than a fused "$376.31" word would.
+      // Use the "$" word's right edge for the column check if present, since
+      // it's comparable to fused "$xxx" words that established the price column.
+      // Allow slightly extra tolerance for the gap between "$" and the number.
+      let checkRight = ordered[i].right;
+      let extraTol = 0;
+      if (i > 0 && ordered[i - 1].text.trim() === '$') {
+        // Only apply "$" fallback for keyword lines (total, subtotal, tax, etc.),
+        // not standalone price fragments like "$ 38.68".
+        const lineText = ordered.map(w => w.text).join(' ').toLowerCase();
+        if (/\b(total|subtotal|sub.?total|balance|amount\s+due|tax|hst|gst|pst|net\s+sales)\b/.test(lineText)) {
+          checkRight = ordered[i - 1].right;
+          extraTol = medH;
+        }
+      }
+      if (Math.abs(checkRight - priceColX) > PRICE_COLUMN_TOLERANCE_FACTOR * medH + extraTol) continue;
     }
 
     // Use the stripped (flag-free) price if that's how it matched
@@ -871,17 +890,20 @@ export function reconstructLines(
 
   // Item prices first so keyword lines don't steal item orphan prices
   mergeOrphanItemPrices(receiptLines, medH);
+  extractBarcodePrices(receiptLines);
   handleWrappedNames(receiptLines, medH);
   // Split combined TAX/BAL lines (e.g. "**** TAX .93 BAL 45.44")
   splitTaxBalLine(receiptLines);
   // Assign prices from adjacent info lines to priceless keyword lines
   // BEFORE mergeOrphanPrices, so keywords don't get wrong orphan prices
   assignAdjacentPricesToKeywords(receiptLines);
+  reconstructBrokenTaxPrices(receiptLines);
   mergeOrphanPrices(receiptLines, medH);
   demotePostTotalItems(receiptLines);
   handleVoidedEntries(receiptLines);
   resolveCompetingTotals(receiptLines);
   fixKeywordPriceAssignment(receiptLines);
+  rescueBarcodeItems(receiptLines);
   removeNullItemNameItems(receiptLines);
 
   console.debug(`[DEBUG] ── Final output: ${receiptLines.length} lines (excluding wrapped)`);

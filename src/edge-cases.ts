@@ -92,6 +92,45 @@ export function assignAdjacentPricesToKeywords(lines: ReceiptLine[]): void {
   }
 }
 
+// ── Reconstruct broken tax prices ────────────────────────────────────────────
+
+/**
+ * Reconstruct tax prices that OCR split into separate tokens.
+ * Examples:
+ *   "Tax $0 59"       → "$0" + "59" → price = "0.59"
+ *   "TOTAL TAX : 00"  → ":" + "00"  → price = "0.00"
+ */
+export function reconstructBrokenTaxPrices(lines: ReceiptLine[]): void {
+  console.debug(`[DEBUG]    reconstructBrokenTaxPrices: scanning for broken tax prices...`);
+  for (const l of lines) {
+    if (l.lineType !== 'tax' || l.price !== null) continue;
+
+    const words = l.words;
+    if (words.length < 2) continue;
+
+    // Walk right→left looking for adjacent tokens that form a price
+    for (let i = words.length - 1; i >= 1; i--) {
+      const curr = words[i].text.trim();
+      const prev = words[i - 1].text.trim();
+
+      // ":XX" or ".XX" → $0.XX (OCR read "." as ":")
+      if (/^[:.]$/.test(prev) && /^\d{2}$/.test(curr)) {
+        l.price = `0.${curr}`;
+        console.debug(`[DEBUG]      Reconstructed tax price: "${prev}${curr}" → ${l.price} on "${l.text}"`);
+        break;
+      }
+
+      // "$X" or "X" + "YY" → $X.YY (OCR dropped the decimal point)
+      if (/^\$?\d+$/.test(prev) && /^\d{2}$/.test(curr)) {
+        const base = prev.replace('$', '');
+        l.price = `${base}.${curr}`;
+        console.debug(`[DEBUG]      Reconstructed tax price: "${prev}" + "${curr}" → ${l.price} on "${l.text}"`);
+        break;
+      }
+    }
+  }
+}
+
 // ── Split combined TAX / BAL lines ───────────────────────────────────────────
 
 /**
@@ -302,6 +341,100 @@ export function removeNullItemNameItems(lines: ReceiptLine[]): void {
   for (let i = lines.length - 1; i >= 0; i--) {
     if (lines[i].itemName === null) {
       lines.splice(i, 1);
+    }
+  }
+}
+
+// ── Rescue barcode items (zero-item fallback) ───────────────────────────────
+
+/**
+ * Last-resort rescue for severely garbled images: if the pipeline found
+ * zero items but there's a valid subtotal, look for info lines that
+ * contain UPC/barcode patterns (8+ digit prefixes).  Promote them to
+ * items with the subtotal price divided equally among them.
+ */
+export function rescueBarcodeItems(lines: ReceiptLine[]): void {
+  console.debug(`[DEBUG]    rescueBarcodeItems: checking for zero-item rescue...`);
+
+  const hasItems = lines.some(
+    (l) => l.lineType === 'untaxed_item' || l.lineType === 'taxed_item',
+  );
+  if (hasItems) return;
+
+  // Find the subtotal value
+  const subtotalLine = lines.find((l) => l.lineType === 'subtotal' && l.price !== null);
+  if (!subtotalLine) {
+    console.debug(`[DEBUG]      No items and no subtotal — nothing to rescue`);
+    return;
+  }
+
+  const subtotalPrice = subtotalLine.price!;
+
+  // Find info lines with barcode patterns (8+ digits at start of text)
+  const barcodeInfoLines: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.lineType !== 'info') continue;
+    // Match barcode: 8+ digits at the start, possibly followed by item name
+    if (/^\d{8,}\b/.test(l.text.replace(/\s/g, '').replace(/^\D+/, '')) ||
+        /\b\d{8,}\b/.test(l.text)) {
+      // Exclude phone numbers (xxx-xxx-xxxx) and dates
+      const cleaned = l.text.replace(/\d{3}-\d{3}-\d{4}/g, '').replace(/\d{1,2}\/\d{1,2}\/\d{2,4}/g, '');
+      if (/\b\d{8,}\b/.test(cleaned)) {
+        barcodeInfoLines.push(i);
+      }
+    }
+  }
+
+  if (barcodeInfoLines.length === 0) {
+    console.debug(`[DEBUG]      No barcode-bearing info lines found`);
+    return;
+  }
+
+  console.debug(`[DEBUG]      Found ${barcodeInfoLines.length} barcode info line(s), subtotal=${subtotalPrice}`);
+
+  for (const idx of barcodeInfoLines) {
+    const l = lines[idx];
+    l.price = subtotalPrice;
+    l.lineType = 'untaxed_item';
+    console.debug(`[DEBUG]      Rescued barcode item line ${idx}: "${l.text}" → price=${subtotalPrice}`);
+  }
+}
+
+// ── Barcode-embedded prices ──────────────────────────────────────────────────
+
+/**
+ * Some receipts fuse barcode numbers with the item price via underscores,
+ * e.g. "049000055375_1.00 T".  Extract the price, remove the barcode word
+ * (and optional trailing tax flag), and reclassify the line as an item.
+ * Must run BEFORE handleWrappedNames so the line is no longer "info".
+ */
+export function extractBarcodePrices(lines: ReceiptLine[]): void {
+  console.debug(`[DEBUG]    extractBarcodePrices: scanning for barcode-embedded prices...`);
+  for (const l of lines) {
+    if (l.lineType !== 'info' || l.price !== null) continue;
+
+    for (let i = 0; i < l.words.length; i++) {
+      const m = l.words[i].text.match(/^\d{6,}[_.](\d+\.\d{2})$/);
+      if (!m) continue;
+
+      const price = m[1];
+      // Check if next word is a single-letter tax flag (e.g. T, N)
+      let suffix = '';
+      let removeCount = 1;
+      if (i + 1 < l.words.length && /^[A-Z]$/i.test(l.words[i + 1].text.trim())) {
+        suffix = ' ' + l.words[i + 1].text.trim().toUpperCase();
+        removeCount = 2;
+      }
+
+      l.price = price + suffix;
+      l.words.splice(i, removeCount);
+      l.text = l.words.map(w => w.text).join(' ');
+      l.itemName = l.text;
+      l.lineType = classifyLine(l.text, l.price);
+
+      console.debug(`[DEBUG]      Extracted barcode price: ${l.price} → "${l.text}"`);
+      break;
     }
   }
 }
@@ -547,7 +680,28 @@ export function mergeOrphanPrices(lines: ReceiptLine[], medH: number): void {
       cur.lineType = classifyLine(cur.text, cur.price);
       nxt.lineType = 'wrapped';
     } else {
-      console.debug(`[DEBUG]      No orphan price found for "${cur.text}"`);
+      // ── For total lines: check if adjacent tender line has a price ────
+      // On EBT receipts, "BALANCE DUE" is followed by "Food Stamps $20.13"
+      // where the tender price equals the total.
+      if (cur.lineType === 'total') {
+        for (let j = i + 1; j <= Math.min(lines.length - 1, i + 2); j++) {
+          const adj = lines[j];
+          if (adj.lineType === 'wrapped') continue;
+          if (adj.price !== null && adj.lineType === 'tender' && adj.words.length > 0) {
+            const adjTop = Math.min(...adj.words.map(w => w.top));
+            const gap = adjTop - curBottom;
+            if (gap <= WRAP_MAX_VERTICAL_GAP_FACTOR * medH) {
+              console.debug(`[DEBUG]      Total takes tender price: "${cur.text}" ← "${adj.price}" from "${adj.text}" (gap=${gap.toFixed(1)})`);
+              cur.price = adj.price;
+              break;
+            }
+          }
+          break; // only check immediate non-wrapped neighbor
+        }
+      }
+      if (cur.price === null) {
+        console.debug(`[DEBUG]      No orphan price found for "${cur.text}"`);
+      }
     }
   }
 
@@ -574,7 +728,7 @@ export function mergeOrphanPrices(lines: ReceiptLine[], medH: number): void {
       }
     }
 
-    if (bestIdx >= 0) {
+    if (bestIdx >= 0 && bestDist <= 5 * medH) {
       const orphan = lines[bestIdx];
       console.debug(`[DEBUG]      Last-resort merge: "${cur.text}" ← orphan "${orphan.price}" (Ydist=${bestDist.toFixed(1)})`);
       cur.price = orphan.price;

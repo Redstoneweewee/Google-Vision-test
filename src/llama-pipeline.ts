@@ -1,10 +1,10 @@
 /**
  * Llama 3.2 receipt post-processing pipeline.
  *
- * Sends only item/discount lines to Llama 3.2 for name cleanup and
- * tax code identification. All other receipt values (subtotal, tax,
- * total, tender, tax rates, discounts) are computed algorithmically
- * from the already-classified ReceiptLines.
+ * Sends only item names to Llama 3.2 for name cleanup. All other
+ * receipt values (subtotal, tax, total, tender, tax rates, discounts,
+ * prices, tax codes) are computed algorithmically from the
+ * already-classified ReceiptLines.
  *
  * Requirements:
  *   - Ollama must be running locally (default: http://localhost:11434)
@@ -28,66 +28,59 @@ import { determineTaxGroups } from './stores';
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? 'llama3.2';
 
-// ── Build minimal input: only item/discount lines ────────────────────────────
+// ── Build minimal input: only item names, numbered ───────────────────
 
 /**
- * Convert reconstructed ReceiptLines into a compact JSON representation
- * containing only item and discount lines — the only lines Llama needs
- * to interpret (name cleanup + tax code identification).
- *
- * Each entry includes the raw text, algorithmically-detected price, and
- * the line's center position for spatial context.
+ * Extract raw item names (no discounts) from ReceiptLines as numbered lines.
+ * Llama only needs the item names to clean up — everything else is algorithmic.
+ * Numbered format makes 1:1 correspondence structurally explicit.
  */
 export function buildLlamaInput(lines: ReceiptLine[]): string {
   const visibleLines = lines.filter((l) => l.lineType !== 'wrapped');
-  const items: { t: string; price: string; type: string }[] = [];
+  const numbered: string[] = [];
 
   for (const line of visibleLines) {
     if (
       line.lineType !== 'untaxed_item' &&
-      line.lineType !== 'taxed_item' &&
-      line.lineType !== 'discount'
+      line.lineType !== 'taxed_item'
     ) {
       continue;
     }
 
-    // Skip discount lines with no price — these are descriptive text
-    // (e.g. "PROMOTIONAL DISCOUNT OR COUPON"), not actual discount transactions
-    if (line.lineType === 'discount' && line.price == null) {
-      continue;
-    }
-
-    const taxCode = extractTaxCode(line.price);
-    const cleanPrice = (line.price ?? '?').replace(/\s*[A-Z]$/i, '').trim();
-    const priceSuffix = taxCode ? `${cleanPrice} ${taxCode}` : cleanPrice;
-
-    items.push({
-      t: line.itemName ?? line.text,
-      price: priceSuffix,
-      type: line.lineType === 'discount' ? 'discount' : 'item',
-    });
+    const name = line.itemName ?? line.text;
+    numbered.push(`${numbered.length + 1}. ${name}`);
   }
 
-  return JSON.stringify(items);
+  return numbered.join('\n');
 }
 
 // ── Prompt ───────────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You parse receipt items. Input is a JSON array of objects with:
-- "t": raw OCR text of an item or discount line
-- "price": the algorithmically-detected price (already correct — do NOT change it). If the price string ends with a letter (e.g. "5.48 N"), that letter is the tax code.
-- "type": "item" or "discount"
+const SYSTEM_PROMPT = `You clean up receipt item names. Input is a numbered list of raw OCR item names from a receipt.
 
-Your job is ONLY to clean up the item name from the raw OCR text. Do NOT invent items, change prices, or add items not in the input.
-Output one entry per input entry, in the same order, including discounts.
-Respond with a SINGLE JSON object containing ONE "items" array:
-{"items":[{"name":"Bananas","price":0.20,"taxCode":"N"},{"name":"Frappuccino","price":5.48,"taxCode":"N"},{"name":"Discount given","price":-0.57,"taxCode":null}]}
+Return a numbered list with the SAME numbers, one cleaned name per line.
+
+Example input:
+1. BNLS SKNLS CHKN BR
+2. FRSH STRWBRRS 1LB
+3. MBR DISC
+
+Example output:
+1. Boneless Skinless Chicken Breast
+2. Fresh Strawberries
+3. Member Discount
+
 Rules:
-- ALL items AND discounts go in ONE "items" array — one output per input, same order
-- name: cleaned item name — fix OCR errors, remove barcodes/UPCs/quantities, use sentence case
-- price: use the EXACT numeric price from the input. Discounts ("type":"discount") must be NEGATIVE.
-- taxCode: if the "price" string ends with a letter (e.g. "0.20 N"), set taxCode to that letter (e.g. "N"). Otherwise null.
-- Return ONLY the JSON, no extra text`;
+- Return EXACTLY the same count of numbered lines as the input
+- Each input line N maps to EXACTLY one output line N
+- NEVER split one input line into multiple output lines
+- NEVER merge multiple input lines into one output line
+- NEVER skip or omit any input line
+- Fix OCR errors and expand abbreviations (e.g. "pkg" → "Package", "org" → "Organic")
+- Remove barcodes, UPC numbers, store codes, and quantity prefixes
+- Use sentence case
+- If a name is unrecognizable, clean it up as best you can
+- Return ONLY the numbered list, no extra text`;
 
 // ── HTTP helper ──────────────────────────────────────────────────────────────
 
@@ -95,6 +88,8 @@ interface OllamaResponse {
   model: string;
   response: string;
   done: boolean;
+  prompt_eval_count?: number;  // input tokens
+  eval_count?: number;         // output tokens
 }
 
 function ollamaGenerate(prompt: string, systemPrompt: string): Promise<string> {
@@ -127,6 +122,7 @@ function ollamaGenerate(prompt: string, systemPrompt: string): Promise<string> {
         timeout: 120_000,
       },
       (res) => {
+        
         const chunks: Buffer[] = [];
         res.on('data', (chunk: Buffer) => chunks.push(chunk));
         res.on('end', () => {
@@ -137,6 +133,9 @@ function ollamaGenerate(prompt: string, systemPrompt: string): Promise<string> {
           }
           try {
             const parsed: OllamaResponse = JSON.parse(raw);
+            if (parsed.prompt_eval_count !== undefined || parsed.eval_count !== undefined) {
+              console.log(`Ollama tokens — input: ${parsed.prompt_eval_count ?? '?'}, output: ${parsed.eval_count ?? '?'}`);
+            }
             resolve(parsed.response);
           } catch {
             reject(new Error(`Failed to parse Ollama response: ${raw.slice(0, 500)}`));
@@ -160,75 +159,57 @@ function ollamaGenerate(prompt: string, systemPrompt: string): Promise<string> {
 
 // ── Response parsing ─────────────────────────────────────────────────────────
 
-interface LlamaItem {
-  text: string;
-  name: string;
-  price: number;
-  taxCode: string | null;
-}
-
-interface LlamaResponse {
-  items: LlamaItem[];
-}
-
 /**
- * Extract JSON from a Llama response that may have markdown fences,
- * extra braces, or repeated "items" keys (malformed JSON where Llama
- * outputs each item as a separate "items" key).
+ * Parse a numbered list response from Llama into an array of cleaned names.
+ * Expects lines like "1. Cleaned Name" or "1) Cleaned Name".
+ * Falls back to JSON array parsing if numbered format isn't found.
  */
-function extractJson(text: string): string {
+function parseNumberedResponse(text: string): string[] {
+  // Try numbered list format first: "1. Name" or "1) Name"
+  const numberedLines = text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^\d+[.)]/  .test(line))
+    .map((line) => line.replace(/^\d+[.)\s]+/, '').trim());
+
+  if (numberedLines.length > 0) return numberedLines;
+
+  // Fallback: try JSON array
   const fenceMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
   if (fenceMatch) text = fenceMatch[1].trim();
 
-  const braceStart = text.indexOf('{');
-  if (braceStart === -1) return text.trim();
-
-  // Extract the full outer {...} using brace counting
-  let rawJson: string;
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  let endIdx = -1;
-  for (let i = braceStart; i < text.length; i++) {
-    const ch = text[i];
-    if (escape) { escape = false; continue; }
-    if (ch === '\\' && inString) { escape = true; continue; }
-    if (ch === '"') { inString = !inString; continue; }
-    if (inString) continue;
-    if (ch === '{') depth++;
-    if (ch === '}') {
-      depth--;
-      if (depth === 0) { endIdx = i; break; }
+  const bracketStart = text.indexOf('[');
+  if (bracketStart !== -1) {
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let endIdx = -1;
+    for (let i = bracketStart; i < text.length; i++) {
+      const ch = text[i];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\' && inString) { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === '[') depth++;
+      if (ch === ']') { depth--; if (depth === 0) { endIdx = i; break; } }
     }
+    const rawJson = endIdx !== -1 ? text.slice(bracketStart, endIdx + 1) : text.trim();
+    try {
+      const parsed = JSON.parse(rawJson);
+      if (Array.isArray(parsed)) return parsed.map(String);
+    } catch { /* fall through */ }
   }
 
-  if (endIdx !== -1) {
-    rawJson = text.slice(braceStart, endIdx + 1);
-  } else {
-    const braceEnd = text.lastIndexOf('}');
-    rawJson = braceEnd > braceStart
-      ? text.slice(braceStart, braceEnd + 1)
-      : text.trim();
-  }
-
-  // Fix malformed JSON where Llama repeats "items":[...] keys.
-  // Merge all arrays into one: {"items":[...],"items":[...]} → {"items":[...,...]}
-  const repeatedKeyPattern = /"items"\s*:\s*\[/g;
-  const matches = [...rawJson.matchAll(repeatedKeyPattern)];
-  if (matches.length > 1) {
-    // Extract each individual item object from all the repeated arrays
-    const allItems: string[] = [];
-    const itemPattern = /\{\s*"name"\s*:[^}]+\}/g;
-    let m: RegExpExecArray | null;
-    while ((m = itemPattern.exec(rawJson)) !== null) {
-      allItems.push(m[0]);
+  // Fallback: try {"items":[...]} format
+  try {
+    const braceStart = text.indexOf('{');
+    if (braceStart !== -1) {
+      const obj = JSON.parse(text.slice(braceStart));
+      if (Array.isArray(obj?.items)) return obj.items.map((i: any) => typeof i === 'string' ? i : i.name ?? String(i));
     }
-    if (allItems.length > 0) {
-      return `{"items":[${allItems.join(',')}]}`;
-    }
-  }
+  } catch { /* fall through */ }
 
-  return rawJson;
+  return [];
 }
 
 // ── Algorithmic extraction from ReceiptLines ─────────────────────────────────
@@ -326,8 +307,8 @@ function buildItemsFromLines(lines: ReceiptLine[]): ReceiptItem[] {
 // ── Main pipeline function ───────────────────────────────────────────────────
 
 /**
- * Send item/discount lines to Llama 3.2 for name cleanup and tax code
- * identification, then compute all other values algorithmically.
+ * Send item names to Llama 3.2 for name cleanup, then compute all
+ * other values algorithmically.
  */
 export async function processReceiptWithLlama(
   compactInput: string,
@@ -339,7 +320,8 @@ export async function processReceiptWithLlama(
 }> {
   const start = Date.now();
 
-  const userPrompt = `Parse these receipt items:\n\n${compactInput}`;
+  const inputCount = compactInput.split('\n').length;
+  const userPrompt = `Clean these ${inputCount} receipt item names:\n\n${compactInput}`;
 
   console.log('── Llama input ──────────────────────────────────────────');
   console.log(compactInput);
@@ -359,57 +341,30 @@ export async function processReceiptWithLlama(
 
   const elapsed = Date.now() - start;
 
-  // Parse Llama JSON response
-  let parsed: LlamaResponse;
-  if (responseText) {
-    const jsonStr = extractJson(responseText);
-    try {
-      parsed = JSON.parse(jsonStr);
-    } catch {
-      console.warn(`Llama returned invalid JSON — using algorithmic names only`);
-      parsed = { items: [] };
-    }
-  } else {
-    parsed = { items: [] };
-  }
+  // Parse Llama response (numbered list of cleaned names)
+  const llamaNames: string[] = responseText
+    ? parseNumberedResponse(responseText)
+    : [];
 
   // ── Build items algorithmically (prices, tax codes, discounts) ────
   const items = buildItemsFromLines(lines);
 
   // ── Overlay Llama's cleaned names onto algorithmic items ────────────
-  // Llama is only used for name cleanup. Prices, tax codes, and discounts
-  // come from the algorithm which is more reliable.
-  const llamaItems = parsed.items ?? [];
-
-  // Build a list of non-discount Llama items (just cleaned names)
-  const llamaNames = llamaItems
-    .filter((li) => !(typeof li.price === 'number' && li.price < 0))
-    .map((li) => li.name);
-
   if (llamaNames.length === items.length) {
-    // Counts match: apply names 1:1
     for (let i = 0; i < items.length; i++) {
       items[i].name = llamaNames[i];
     }
-    console.log(`Llama names applied 1:1 (${llamaNames.length} items)`);
-  } else if (llamaNames.length > 0) {
-    // Counts don't match: try to match by price
-    const used = new Set<number>();
-    for (const item of items) {
-      for (let j = 0; j < llamaItems.length; j++) {
-        if (used.has(j)) continue;
-        const li = llamaItems[j];
-        if (typeof li.price === 'number' && li.price >= 0 &&
-            Math.abs(li.price - item.originalPrice) < 0.01) {
-          item.name = li.name;
-          used.add(j);
-          break;
-        }
-      }
+    console.log(`Llama names: ${llamaNames.length}/${items.length} OK`);
+  } else if (llamaNames.length > items.length && items.length > 0) {
+    // Llama returned extra names (hallucination) — use the first N
+    for (let i = 0; i < items.length; i++) {
+      items[i].name = llamaNames[i];
     }
-    console.log(`Llama returned ${llamaNames.length} items vs ${items.length} algorithmic — matched by price`);
+    console.log(`Llama names: ${items.length}/${items.length} OK (truncated from ${llamaNames.length})`);
+  } else if (llamaNames.length > 0) {
+    console.log(`Llama names: ${llamaNames.length}/${items.length} MISMATCH`);
   } else {
-    console.log(`Llama returned no usable items — using algorithmic names`);
+    console.log(`Llama names: 0/${items.length} MISMATCH`);
   }
 
   // ── Algorithmic values from classified lines ────────────────────────

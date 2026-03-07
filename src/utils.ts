@@ -109,7 +109,7 @@ export function tryStripTaxFlag(text: string): string | null {
 
 const SUBTOTAL_KEYWORDS = ['subtotal', 'sub-total', 'sub total', 'net sales'];
 const TOTAL_KEYWORDS = ['total', 'amount due', 'balance', 'grand total'];
-const TAX_KEYWORDS_RE = [/\btax\d*\b/, /\bhst\b/, /\bgst\b/, /\bpst\b/, /\bvat\b/];
+const TAX_KEYWORDS_RE = [/\btax[i\d]*\b/, /\bhst\b/, /\bgst\b/, /\bpst\b/, /\bvat\b/, /\btex\b/, /\bsales\s*tax\b/];
 const DISCOUNT_KEYWORDS = [
   'disc',
   'discount',
@@ -147,7 +147,7 @@ const TENDER_KEYWORDS_RE = [
   /\btip\b/, /\bgratuity\b/, /\bservice charge\b/,
   /\bapproved\b/, /\bauth code\b/, /\baid\s*:/, /\bchip\b/,
   /\bpaid\b/, /\bpayment\b/, /\bactivation\b/, /\bredemption\b/,
-  /\btend\b/,
+  /\btend\b/, /\bfood\s+stamps?\b/,
 ];
 
 /**
@@ -258,6 +258,16 @@ export function parseTaxRateLine(text: string, price: string | null): { code: st
     return {
       code: m[1],
       rate: parseFloat(m[2]) / 100,
+      amount: parsePrice(price),
+    };
+  }
+
+  // Format 3: "sales tax 9.125%" or "salestax 9.125%"
+  m = text.match(/\bsales\s*tax\s+(\d+(?:\.\d+)?)\s*%/i);
+  if (m) {
+    return {
+      code: '',
+      rate: parseFloat(m[1]) / 100,
       amount: parsePrice(price),
     };
   }

@@ -53,6 +53,9 @@ interface TestResult {
   file: string;       // relative path
   store: string;      // subfolder name (costco, target …)
   score: number;      // 0-100 (or -1 on error)
+  items: number | null;
+  tax: string | null;
+  total: string | null;
   output: string;     // full coloured console output
   error?: string;
 }
@@ -129,10 +132,17 @@ interface TestResult {
       const m = clean.match(/Score:\s*(\d+)%/);
       const score = m ? parseInt(m[1], 10) : -1;
 
-      result = { file: relPath, store, score, output: combined };
+      const mItems = clean.match(/Total items:\s*(\d+)/);
+      const items = mItems ? parseInt(mItems[1], 10) : null;
+      const mTax = clean.match(/OCR tax:\s*\$(\S+)/);
+      const tax = mTax && mTax[1] !== '(not' ? mTax[1] : null;
+      const mTotal = clean.match(/OCR total:\s*\$(\S+)/);
+      const total = mTotal && mTotal[1] !== '(not' ? mTotal[1] : null;
+
+      result = { file: relPath, store, score, items, tax, total, output: combined };
     } catch (err: any) {
       const msg = err.stderr || err.stdout || err.message || String(err);
-      result = { file: relPath, store, score: -1, output: msg, error: msg };
+      result = { file: relPath, store, score: -1, items: null, tax: null, total: null, output: msg, error: msg };
     }
 
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
@@ -164,9 +174,12 @@ interface TestResult {
 
   const COL_FILE = 45;
   const COL_SCORE = 8;
-  const headerLine = `  ${'File'.padEnd(COL_FILE)} ${'Score'.padStart(COL_SCORE)}`;
+  const COL_ITEMS = 7;
+  const COL_TAX = 10;
+  const COL_TOTAL = 10;
+  const headerLine = `  ${'File'.padEnd(COL_FILE)} ${'Score'.padStart(COL_SCORE)} ${'Items'.padStart(COL_ITEMS)} ${'Tax'.padStart(COL_TAX)} ${'Total'.padStart(COL_TOTAL)}`;
   console.log(colorDim(headerLine));
-  console.log(colorDim(`  ${'─'.repeat(COL_FILE)} ${'─'.repeat(COL_SCORE)}`));
+  console.log(colorDim(`  ${'─'.repeat(COL_FILE)} ${'─'.repeat(COL_SCORE)} ${'─'.repeat(COL_ITEMS)} ${'─'.repeat(COL_TAX)} ${'─'.repeat(COL_TOTAL)}`));
 
   let totalPassed = 0;
   let totalTests = results.length;
@@ -187,11 +200,14 @@ interface TestResult {
       } else {
         scoreCell = colorError(`${r.score}%`.padStart(COL_SCORE));
       }
-      console.log(`  ${name} ${scoreCell}`);
+      const itemsCell = (r.items !== null ? String(r.items) : '-').padStart(COL_ITEMS);
+      const taxCell = (r.tax !== null ? `$${r.tax}` : '-').padStart(COL_TAX);
+      const totalCell = (r.total !== null ? `$${r.total}` : '-').padStart(COL_TOTAL);
+      console.log(`  ${name} ${scoreCell} ${colorDim(itemsCell)} ${colorDim(taxCell)} ${colorDim(totalCell)}`);
     }
   }
 
-  console.log(colorDim(`\n  ${'─'.repeat(COL_FILE + COL_SCORE + 1)}`));
+  console.log(colorDim(`\n  ${'─'.repeat(COL_FILE + COL_SCORE + COL_ITEMS + COL_TAX + COL_TOTAL + 4)}`));
 
   const pctPassed = totalTests > 0 ? ((totalPassed / totalTests) * 100).toFixed(0) : '0';
   const summaryColor = totalPassed === totalTests ? colorPass : totalPassed > totalTests * 0.8 ? colorWarn : colorError;
@@ -222,15 +238,18 @@ interface TestResult {
   // Score table
   lines.push('SCORE SUMMARY');
   lines.push('-'.repeat(60));
-  lines.push(`  ${'File'.padEnd(COL_FILE)} ${'Score'.padStart(COL_SCORE)}`);
-  lines.push(`  ${'─'.repeat(COL_FILE)} ${'─'.repeat(COL_SCORE)}`);
+  lines.push(`  ${'File'.padEnd(COL_FILE)} ${'Score'.padStart(COL_SCORE)} ${'Items'.padStart(COL_ITEMS)} ${'Tax'.padStart(COL_TAX)} ${'Total'.padStart(COL_TOTAL)}`);
+  lines.push(`  ${'─'.repeat(COL_FILE)} ${'─'.repeat(COL_SCORE)} ${'─'.repeat(COL_ITEMS)} ${'─'.repeat(COL_TAX)} ${'─'.repeat(COL_TOTAL)}`);
   for (const store of stores) {
     const storeResults = results.filter((r) => r.store === store);
     lines.push('');
     lines.push(`  ${store.toUpperCase()}`);
     for (const r of storeResults) {
       const scoreText = r.score === -1 ? 'ERR' : `${r.score}%`;
-      lines.push(`  ${r.file.padEnd(COL_FILE)} ${scoreText.padStart(COL_SCORE)}`);
+      const itemsText = r.items !== null ? String(r.items) : '-';
+      const taxText = r.tax !== null ? `$${r.tax}` : '-';
+      const totalText = r.total !== null ? `$${r.total}` : '-';
+      lines.push(`  ${r.file.padEnd(COL_FILE)} ${scoreText.padStart(COL_SCORE)} ${itemsText.padStart(COL_ITEMS)} ${taxText.padStart(COL_TAX)} ${totalText.padStart(COL_TOTAL)}`);
     }
   }
   lines.push('');
