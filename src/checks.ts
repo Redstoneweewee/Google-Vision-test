@@ -62,19 +62,30 @@ export interface CheckContext {
 
 /** 1) T ≈ S + X — do the three OCR summary lines agree internally? */
 function checkTotalEqualsSubtotalPlusTax(ctx: CheckContext): CheckResult | null {
-  const { ocrTotal, ocrSubtotal, ocrTax } = ctx;
+  const { ocrTotal, ocrSubtotal, ocrTax, tenderAmount } = ctx;
   if (ocrTotal === null || ocrSubtotal === null || ocrTax === null) return null;
   const expected = ocrSubtotal + ocrTax;
   const delta = Math.abs(ocrTotal - expected);
   const ok = delta < CENTS_TOLERANCE;
+
+  // A service charge / auto-gratuity is added to the total after tax.
+  // When the gap between total and (subtotal+tax) matches the tender amount
+  // and the tender is clearly not the full payment (tender << total), pass.
+  const isServiceCharge = !ok &&
+    tenderAmount !== null &&
+    tenderAmount < ocrTotal * 0.9 &&
+    Math.abs(delta - tenderAmount) < CENTS_TOLERANCE;
+
   return {
     id: 'total_eq_subtotal_plus_tax',
-    severity: ok ? 'info' : 'error',
+    severity: (ok || isServiceCharge) ? 'info' : 'error',
     message: ok
       ? `TOTAL ($${ocrTotal.toFixed(2)}) = SUBTOTAL ($${ocrSubtotal.toFixed(2)}) + TAX ($${ocrTax.toFixed(2)})`
-      : `TOTAL ($${ocrTotal.toFixed(2)}) != SUBTOTAL ($${ocrSubtotal.toFixed(2)}) + TAX ($${ocrTax.toFixed(2)}) — off by $${delta.toFixed(2)}`,
+      : isServiceCharge
+        ? `TOTAL ($${ocrTotal.toFixed(2)}) = SUBTOTAL ($${ocrSubtotal.toFixed(2)}) + TAX ($${ocrTax.toFixed(2)}) + service charge ($${tenderAmount!.toFixed(2)})`
+        : `TOTAL ($${ocrTotal.toFixed(2)}) != SUBTOTAL ($${ocrSubtotal.toFixed(2)}) + TAX ($${ocrTax.toFixed(2)}) — off by $${delta.toFixed(2)}`,
     delta,
-    penalty: ok ? 0 : 10 + delta * 100,
+    penalty: (ok || isServiceCharge) ? 0 : 10 + delta * 100,
   };
 }
 
@@ -139,12 +150,26 @@ function checkCalcSubtotalVsTotalMinusTax(ctx: CheckContext): CheckResult | null
     }
   }
 
+  // A service charge / auto-gratuity between subtotal and total means the
+  // items correctly match the subtotal but total > subtotal + tax.
+  // When the gap equals an explicit tender (service charge not a payment),
+  // treat the check as passing.
+  const { tenderAmount } = ctx;
+  const isServiceCharge = !ok &&
+    tenderAmount !== null &&
+    ocrTotal !== null &&
+    tenderAmount < ocrTotal * 0.9 &&
+    Math.abs(delta - tenderAmount) < CENTS_TOLERANCE;
+  if (isServiceCharge) penalty = 0;
+
   return {
     id: 'calc_subtotal_vs_total_minus_tax',
-    severity: ok ? 'info' : (penalty === 0 ? 'info' : delta > 5 ? 'error' : 'warn'),
+    severity: ok || isServiceCharge ? 'info' : (penalty === 0 ? 'info' : delta > 5 ? 'error' : 'warn'),
     message: ok
       ? `Calculated subtotal ($${calculatedSubtotal.toFixed(2)}) matches ${label}`
-      : `Calculated subtotal ($${calculatedSubtotal.toFixed(2)}) is $${delta.toFixed(2)} ${direction} than ${label} — we may have ${direction === 'less' ? 'missed items' : 'extra items'}`,
+      : isServiceCharge
+        ? `Calculated subtotal ($${calculatedSubtotal.toFixed(2)}) matches ${label} minus service charge ($${tenderAmount!.toFixed(2)})`
+        : `Calculated subtotal ($${calculatedSubtotal.toFixed(2)}) is $${delta.toFixed(2)} ${direction} than ${label} — we may have ${direction === 'less' ? 'missed items' : 'extra items'}`,
     delta,
     penalty,
   };
@@ -161,14 +186,17 @@ function checkTaxConsistency(ctx: CheckContext): CheckResult | null {
   const expectedTax = Math.round(taxedItemsValue * taxRate * 100) / 100;
   const delta = Math.abs(ocrTax - expectedTax);
   const ok = delta < CENTS_TOLERANCE;
+  // Per-item tax rounding can cause up to a few cents of discrepancy.
+  // Treat differences ≤ $0.05 as informational rather than warnings.
+  const perLineRounding = !ok && delta <= 0.05;
   return {
     id: 'tax_consistency',
-    severity: ok ? 'info' : (delta > 0.1 ? 'error' : 'warn'),
+    severity: ok || perLineRounding ? 'info' : (delta > 0.1 ? 'error' : 'warn'),
     message: ok
       ? `OCR TAX ($${ocrTax.toFixed(2)}) ~= taxed items ($${taxedItemsValue.toFixed(2)}) x rate (${(taxRate * 100).toFixed(2)}%) = $${expectedTax.toFixed(2)}`
       : `OCR TAX ($${ocrTax.toFixed(2)}) != taxed items ($${taxedItemsValue.toFixed(2)}) x rate (${(taxRate * 100).toFixed(2)}%) = $${expectedTax.toFixed(2)} — off by $${delta.toFixed(2)} (possible per-line rounding)`,
     delta,
-    penalty: ok ? 0 : 3 + delta * 200,
+    penalty: ok || perLineRounding ? 0 : 3 + delta * 200,
   };
 }
 

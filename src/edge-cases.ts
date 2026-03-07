@@ -23,7 +23,10 @@ import {
  */
 function isTrivialItemName(name: string | null): boolean {
   if (name === null) return true;
-  const cleaned = name.replace(/[^a-zA-Z0-9]/g, '');
+  const t = name.trim();
+  // A bare price number (e.g. "7.28", "$20.96", "1.00") is a price-only line, not a real item name
+  if (/^\$?\d+(\.\d{1,2})?$/.test(t)) return true;
+  const cleaned = t.replace(/[^a-zA-Z0-9]/g, '');
   return cleaned.length <= 1;
 }
 
@@ -32,11 +35,27 @@ function isTrivialItemName(name: string | null): boolean {
 /**
  * Handle `** VOIDED ENTRY` markers: demote the preceding item to 'info'.
  */
+// Fine-print phrases that contain the word "void" but are NOT void markers.
+// These are common legalese snippets on receipts, coupons, and surveys.
+const VOID_FINE_PRINT_PATTERNS: RegExp[] = [
+  /void where prohibited/i,
+  /void if/i,
+  /void after/i,
+  /not valid.*void/i,
+  /void outside/i,
+];
+
 export function handleVoidedEntries(lines: ReceiptLine[]): void {
   console.debug(`[DEBUG]    handleVoidedEntries: scanning for void markers...`);
   for (let i = 0; i < lines.length; i++) {
     const lower = lines[i].text.toLowerCase();
     if (!/\bvoid(ed)?\b/.test(lower)) continue;
+
+    // Skip fine-print phrases — these are legalese, not POS void markers
+    if (VOID_FINE_PRINT_PATTERNS.some((p) => p.test(lines[i].text))) {
+      console.debug(`[DEBUG]      Skipping fine-print void line ${i}: "${lines[i].text}"`);
+      continue;
+    }
 
     console.debug(`[DEBUG]      Found void marker at line ${i}: "${lines[i].text}"`);
     // Demote the closest preceding item line
@@ -224,6 +243,27 @@ export function demotePostTotalItems(lines: ReceiptLine[]): void {
  */
 export function fixKeywordPriceAssignment(lines: ReceiptLine[]): void {
   console.debug(`[DEBUG]    fixKeywordPriceAssignment: checking keyword price consistency...`);
+
+  // --- Phase 0: Extract embedded prices from keyword lines with none -------
+  // Handles receipts like "SUBTOTAL : $20.96" where the price is in-line
+  // but was not placed at the price column during stage 4.
+  for (const l of lines) {
+    if (l.lineType === 'wrapped') continue;
+    if (!['subtotal', 'tax', 'total'].includes(l.lineType)) continue;
+    if (l.price !== null) continue; // already has a price
+
+    // Find the last $X.XX or X.XX pattern in the text
+    const matches = [...l.text.matchAll(/\$?(\d+\.\d{2})\b/g)];
+    if (matches.length === 0) continue;
+    const lastMatch = matches[matches.length - 1];
+    const extracted = lastMatch[1];
+    const val = parseFloat(extracted);
+    if (val > 0) {
+      l.price = extracted;
+      console.debug(`[DEBUG]      Extracted embedded price "${extracted}" from ${l.lineType} line: "${l.text}"`);
+    }
+  }
+
   const sub = lines.find(l => l.lineType === 'subtotal' && l.price !== null);
   const tax = lines.find(l => l.lineType === 'tax' && l.price !== null);
   const tot = lines.find(l => l.lineType === 'total' && l.price !== null);
@@ -342,6 +382,38 @@ export function removeNullItemNameItems(lines: ReceiptLine[]): void {
     if (lines[i].itemName === null) {
       lines.splice(i, 1);
     }
+  }
+}
+
+// ── Demote orphan prices after keyword section ──────────────────────────────
+
+/**
+ * Any item line with a trivial name (just a price, no description) that
+ * appears AFTER the first keyword line (subtotal/tax/total) is almost
+ * certainly a service charge, gratuity, or fee — NOT a purchasable item.
+ * Demote these to 'tender' so they don't inflate the calculated subtotal.
+ */
+export function demoteOrphanPostSubtotalPrices(lines: ReceiptLine[]): void {
+  console.debug(`[DEBUG]    demoteOrphanPostSubtotalPrices: scanning for post-keyword orphan prices...`);
+
+  // Find the first non-wrapped keyword line
+  let firstKeywordIdx = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].lineType === 'wrapped') continue;
+    if (['subtotal', 'tax', 'total'].includes(lines[i].lineType)) {
+      firstKeywordIdx = i;
+      break;
+    }
+  }
+
+  for (let i = firstKeywordIdx; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.lineType === 'wrapped') continue;
+    if (!['untaxed_item', 'taxed_item'].includes(l.lineType)) continue;
+    if (!isTrivialItemName(l.itemName)) continue;
+
+    console.debug(`[DEBUG]      Demoting post-keyword orphan price ${i}: "${l.text}" (${l.price}) → tender`);
+    l.lineType = 'tender';
   }
 }
 
@@ -509,6 +581,26 @@ export function mergeOrphanItemPrices(lines: ReceiptLine[], medH: number): void 
     }
   }
 
+  // Pre-compute mean Y values of keyword lines so we can skip orphan prices
+  // that sit on the same receipt line as a keyword (those belong to the keyword).
+  const keywordMeanYs: number[] = lines
+    .filter((l) => ['subtotal', 'tax', 'total'].includes(l.lineType) && l.words.length > 0)
+    .map((l) => l.words.reduce((s, w) => s + w.center.y, 0) / l.words.length);
+
+  /** Returns true if the orphan price shares a receipt line with a keyword —
+   *  meaning it is likely the keyword's own price and should NOT be claimed
+   *  by an item modifier.
+   *  Only pure-number prices (no tax flag like "N", "X", "T") can be keyword
+   *  prices; tax-flagged prices always belong to items.
+   */
+  function isReservedForKeyword(candidate: ReceiptLine): boolean {
+    if (candidate.words.length === 0) return false;
+    // Tax-flagged prices (e.g. "3.61 N") are definitively item prices
+    if (candidate.price === null || !/^\d+(\.\d{1,2})?$/.test(candidate.price)) return false;
+    const candMeanY = candidate.words.reduce((s, w) => s + w.center.y, 0) / candidate.words.length;
+    return keywordMeanYs.some((ky) => Math.abs(candMeanY - ky) < 0.7 * medH);
+  }
+
   /** Check if a line is an orphan price (has price, no real item name, not a keyword). */
   function isOrphanPrice(l: ReceiptLine): boolean {
     return (
@@ -516,7 +608,8 @@ export function mergeOrphanItemPrices(lines: ReceiptLine[], medH: number): void 
       isTrivialItemName(l.itemName) &&
       l.lineType !== 'wrapped' &&
       !['subtotal', 'tax', 'total'].includes(l.lineType) &&
-      l.words.length > 0
+      l.words.length > 0 &&
+      !isReservedForKeyword(l)
     );
   }
 

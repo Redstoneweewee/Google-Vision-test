@@ -46,6 +46,7 @@ import {
   reconstructBrokenTaxPrices,
   extractBarcodePrices,
   rescueBarcodeItems,
+  demoteOrphanPostSubtotalPrices,
 } from './edge-cases';
 
 import {
@@ -888,17 +889,22 @@ export function reconstructLines(
     return aY - bY;
   });
 
-  // Item prices first so keyword lines don't steal item orphan prices
+  // Item prices first so keyword lines don't steal item orphan prices.
+  // (mergeOrphanItemPrices skips orphans that are at keyword-line Y level,
+  //  reserving them for keyword assignment by mergeOrphanPrices.)
   mergeOrphanItemPrices(receiptLines, medH);
   extractBarcodePrices(receiptLines);
-  handleWrappedNames(receiptLines, medH);
-  // Split combined TAX/BAL lines (e.g. "**** TAX .93 BAL 45.44")
+  // Claim keyword prices BEFORE handleWrappedNames so the subtotal price
+  // isn't stolen by an adjacent info line wrapping into it.
   splitTaxBalLine(receiptLines);
-  // Assign prices from adjacent info lines to priceless keyword lines
-  // BEFORE mergeOrphanPrices, so keywords don't get wrong orphan prices
   assignAdjacentPricesToKeywords(receiptLines);
   reconstructBrokenTaxPrices(receiptLines);
   mergeOrphanPrices(receiptLines, medH);
+  // Demote standalone trivial-name items after keyword section BEFORE
+  // handleWrappedNames so they are not used as item targets for wrapping.
+  demoteOrphanPostSubtotalPrices(receiptLines);
+  // Now wrap item names (keyword prices already claimed above)
+  handleWrappedNames(receiptLines, medH);
   demotePostTotalItems(receiptLines);
   handleVoidedEntries(receiptLines);
   resolveCompetingTotals(receiptLines);
